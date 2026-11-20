@@ -184,14 +184,19 @@ fn frame_rects(d: &Dup, info: &DXGI_OUTDUPL_FRAME_INFO) -> Vec<(u32, u32, u32, u
     out
 }
 
-/// Copies `rects` of the acquired desktop image into `shared`.
+/// Copies `rects` of the acquired desktop image into `shared`, comparing pixels per 16x16
+/// tile against the previous frame so no-op DWM repaints (e.g. excluded overlays or
+/// full-window invalidations where few pixels changed) do not emit dirty rects or wake
+/// the encoder. Returns whether any pixel actually changed.
 fn copy_rects(
     d: &Dup,
     image: &IDXGIResource,
     rects: &[(u32, u32, u32, u32)],
     shared: &Mutex<Shared>,
-) -> Result<(), String> {
+    force_all: bool,
+) -> Result<bool, String> {
     let tex: ID3D11Texture2D = super::cast(image)?;
+    let mut any_changed = false;
     unsafe {
         if rects.len() > 32 {
             d.ctx.CopyResource(&d.staging, &tex);
@@ -219,21 +224,47 @@ fn copy_rects(
         {
             let mut s = shared.lock();
             for &(x0, y0, x1, y1) in rects {
-                let (a, len) = (x0 as usize * 4, (x1 - x0) as usize * 4);
-                for y in y0 as usize..y1 as usize {
-                    std::ptr::copy_nonoverlapping(
-                        src.add(y * pitch + a),
-                        s.buf.as_mut_ptr().add(y * row + a),
-                        len,
-                    );
+                let (tr0, tr1) = (y0 as usize / 16, (y1 as usize).div_ceil(16));
+                let (tc0, tc1) = (x0 as usize / 16, (x1 as usize).div_ceil(16));
+                for tr in tr0..tr1 {
+                    let ty0 = (tr * 16).max(y0 as usize);
+                    let ty1 = ((tr + 1) * 16).min(y1 as usize);
+                    let mut run_start: Option<u32> = None;
+                    for tc in tc0..tc1 {
+                        let tx0 = (tc * 16).max(x0 as usize);
+                        let tx1 = ((tc + 1) * 16).min(x1 as usize);
+                        let off = tx0 * 4;
+                        let len = (tx1 - tx0) * 4;
+                        let mut changed = force_all;
+                        for y in ty0..ty1 {
+                            let src_row = std::slice::from_raw_parts(src.add(y * pitch + off), len);
+                            let dst_row = &mut s.buf[y * row + off..y * row + off + len];
+                            if !changed && src_row != dst_row {
+                                changed = true;
+                            }
+                            if changed {
+                                dst_row.copy_from_slice(src_row);
+                            }
+                        }
+                        if changed {
+                            any_changed = true;
+                            run_start.get_or_insert(tx0 as u32);
+                        } else if let Some(rx0) = run_start.take() {
+                            s.rects.push((rx0, ty0 as u32, tx0 as u32, ty1 as u32));
+                        }
+                    }
+                    if let Some(rx0) = run_start {
+                        s.rects.push((rx0, ty0 as u32, x1, ty1 as u32));
+                    }
                 }
             }
-            s.rects.extend_from_slice(rects);
-            s.frames += 1;
+            if any_changed {
+                s.frames += 1;
+            }
         }
         d.ctx.Unmap(&d.staging, 0);
     }
-    Ok(())
+    Ok(any_changed)
 }
 
 /// Takes desktop images until `stop`; reopens duplication when Windows takes it away
@@ -292,17 +323,17 @@ fn capture_thread(mut d: Dup, shared: Arc<Mutex<Shared>>, wake: Arc<Wake>, stop:
             log::info!("frame dirty {rects:?}");
         }
         let res = match &image {
-            Some(img) if !rects.is_empty() => copy_rects(&d, img, &rects, &shared),
-            _ => Ok(()),
+            Some(img) if !rects.is_empty() => copy_rects(&d, img, &rects, &shared, first),
+            _ => Ok(false),
         };
         drop(image);
         let _ = unsafe { d.dup.ReleaseFrame() };
         match res {
-            Ok(()) if !rects.is_empty() => {
+            Ok(true) => {
                 first = false;
                 wake.signal();
             }
-            Ok(()) => {}
+            Ok(false) => {}
             Err(e) => log::warn!("capture: {e}"),
         }
     }
@@ -341,19 +372,20 @@ impl Capturer {
                 })
                 .map_err(|e| e.to_string())?
         };
-        let (width, height) = rx
+        let (phys_w, phys_h) = rx
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| "timed out starting capture".to_string())??;
+        let (width, height) = super::capture_size(phys_w, phys_h);
         let r = super::output().map(|o| o.rect()).unwrap_or_default();
         let geometry = Geometry {
             left: r.left,
             top: r.top,
-            width,
-            height,
+            width: phys_w,
+            height: phys_h,
+            stream_width: width,
+            stream_height: height,
         };
         *super::GEOMETRY.lock() = Some(geometry);
-        // x264 wants even sizes; the odd last row or column is left out.
-        let (width, height) = (width & !1, height & !1);
         let mut me = Capturer {
             width,
             height,
@@ -382,7 +414,11 @@ impl Capturer {
         }
         me.pump()?;
         me.grab(me.full())?;
-        log::info!("capturing with DXGI Desktop Duplication at {width}x{height}");
+        if (width, height) != (phys_w & !1, phys_h & !1) {
+            log::info!("capturing with DXGI Desktop Duplication at {phys_w}x{phys_h}, scaling to {width}x{height}");
+        } else {
+            log::info!("capturing with DXGI Desktop Duplication at {width}x{height}");
+        }
         Ok(me)
     }
 
@@ -419,10 +455,27 @@ impl Capturer {
         Ok(())
     }
 
+    fn is_scaled(&self) -> bool {
+        self.width != (self.geometry.width & !1) || self.height != (self.geometry.height & !1)
+    }
+
     /// Record changed areas: rows and blocks for the encoder, `changes` for /wait.
+    /// Input `rects` are in physical framebuffer coordinates; when downscaling, they are
+    /// mapped to streamed coordinates (expanded by 1 px for box-filter edges).
     fn add_damage(&mut self, rects: Vec<(u32, u32, u32, u32)>) {
-        for (x0, y0, x1, y1) in rects {
-            let (x1, y1) = (x1.min(self.width), y1.min(self.height));
+        let scaled = self.is_scaled();
+        let (pw, ph) = (self.geometry.width.max(1) as u64, self.geometry.height.max(1) as u64);
+        let (sw, sh) = (self.width as u64, self.height as u64);
+        for (rx0, ry0, rx1, ry1) in rects {
+            let (x0, y0, x1, y1) = if scaled {
+                let sx0 = ((rx0 as u64 * sw) / pw).saturating_sub(1) as u32;
+                let sy0 = ((ry0 as u64 * sh) / ph).saturating_sub(1) as u32;
+                let sx1 = ((rx1 as u64 * sw).div_ceil(pw) + 1).min(sw) as u32;
+                let sy1 = ((ry1 as u64 * sh).div_ceil(ph) + 1).min(sh) as u32;
+                (sx0, sy0, sx1, sy1)
+            } else {
+                (rx0, ry0, rx1.min(self.width), ry1.min(self.height))
+            };
             if x1 <= x0 || y1 <= y0 {
                 continue;
             }
@@ -467,10 +520,19 @@ impl Capturer {
         }
     }
 
-    /// Copy rows [y0, y1) of the newest desktop image into the frame conversions read.
+    /// Copy rows covering streamed band [y0, y1) of the newest desktop image into `frame`.
     pub fn grab(&mut self, band: Band) -> Result<(), String> {
         let row = self.geometry.width as usize * 4;
-        let (a, b) = (band.y0 as usize * row, band.y1 as usize * row);
+        let (py0, py1) = if self.is_scaled() {
+            let ph = self.geometry.height as u64;
+            let sh = self.height.max(1) as u64;
+            let a = ((band.y0 as u64 * ph) / sh).saturating_sub(2) as usize;
+            let b = ((band.y1 as u64 * ph).div_ceil(sh) + 2).min(ph) as usize;
+            (a, b)
+        } else {
+            (band.y0 as usize, band.y1 as usize)
+        };
+        let (a, b) = (py0 * row, py1 * row);
         let s = self.shared.lock();
         if s.buf.len() >= b && self.frame.len() >= b {
             self.frame[a..b].copy_from_slice(&s.buf[a..b]);
@@ -481,14 +543,28 @@ impl Capturer {
     /// Convert rows [y0, y1) of the current frame into `dst`.
     pub fn convert(&self, dst: &mut crate::convert::I420, y0: usize, y1: usize, threads: usize) {
         let stride = self.geometry.width as usize * 4;
-        crate::convert::convert_band(
-            &self.frame,
-            stride,
-            dst,
-            y0,
-            y1.min(self.height as usize),
-            threads,
-        );
+        if self.is_scaled() {
+            crate::convert::convert_scaled_band(
+                &self.frame,
+                stride,
+                self.geometry.width as usize,
+                self.geometry.height as usize,
+                dst,
+                self.height as usize,
+                y0,
+                y1.min(self.height as usize),
+                threads,
+            );
+        } else {
+            crate::convert::convert_band(
+                &self.frame,
+                stride,
+                dst,
+                y0,
+                y1.min(self.height as usize),
+                threads,
+            );
+        }
     }
 
     /// The current frame as packed BGRX (`width * 4` bytes per row), for screenshots.
@@ -503,8 +579,23 @@ impl Capturer {
             std::mem::take(&mut s.rects)
         };
         self.add_damage(rects);
-        let (row, h) = (self.width as usize * 4, self.height as usize);
+        let (w, h) = (self.width as usize, self.height as usize);
+        let row = w * 4;
         let stride = self.geometry.width as usize * 4;
+        if self.is_scaled() {
+            let mut out = vec![0u8; row * h];
+            crate::convert::scale_bgrx(
+                &self.frame,
+                stride,
+                self.geometry.width as usize,
+                self.geometry.height as usize,
+                &mut out,
+                row,
+                w,
+                h,
+            );
+            return Ok(out);
+        }
         let mut out = Vec::with_capacity(row * h);
         for line in self.frame.chunks_exact(stride).take(h) {
             out.extend_from_slice(&line[..row]);

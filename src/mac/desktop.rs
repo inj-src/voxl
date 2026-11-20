@@ -145,6 +145,12 @@ fn clipboard_loop(hub: Arc<Hub>, state: Arc<Mutex<ClipState>>) {
                 hub.broadcast(|| Out::Text(msg.clone()));
                 return;
             }
+            let max_img = hub
+                .max_clipboard_image_bytes
+                .load(std::sync::atomic::Ordering::Relaxed) as usize;
+            if max_img == 0 {
+                return;
+            }
             let png = pb.dataForType(NSPasteboardTypePNG).or_else(|| {
                 let tiff = pb.dataForType(NSPasteboardTypeTIFF)?;
                 NSBitmapImageRep::imageRepWithData(&tiff)?.representationUsingType_properties(
@@ -156,7 +162,7 @@ fn clipboard_loop(hub: Arc<Hub>, state: Arc<Mutex<ClipState>>) {
                 return;
             };
             let data = png.to_vec();
-            if data.is_empty() || data.len() > MAX_IMAGE {
+            if data.is_empty() || data.len() > MAX_IMAGE.min(max_img) {
                 return;
             }
             let h = hash(&data);
@@ -180,7 +186,6 @@ fn clipboard_loop(hub: Arc<Hub>, state: Arc<Mutex<ClipState>>) {
 #[allow(deprecated)]
 fn cursor_loop(hub: Arc<Hub>) {
     let mut last: Option<u64> = None;
-    let mut serial = 0u32;
     loop {
         std::thread::sleep(Duration::from_millis(33));
         if hub.clients.lock().is_empty() {
@@ -201,19 +206,13 @@ fn cursor_loop(hub: Arc<Hub>) {
                 return;
             }
             last = Some(key);
-            serial = serial.wrapping_add(1);
-            let mut msg = Vec::with_capacity(14 + rgba.len());
-            msg.push(0x03);
-            msg.push(0);
-            msg.extend_from_slice(&(w as u16).to_be_bytes());
-            msg.extend_from_slice(&(h as u16).to_be_bytes());
-            msg.extend_from_slice(&((hot.x * scale).round() as u16).to_be_bytes());
-            msg.extend_from_slice(&((hot.y * scale).round() as u16).to_be_bytes());
-            msg.extend_from_slice(&serial.to_be_bytes());
-            msg.extend_from_slice(&rgba);
-            let b = Bytes::from(msg);
-            *hub.cursor.lock() = Some(b.clone());
-            hub.broadcast(|| Out::Bin(b.clone()));
+            hub.publish_cursor(
+                w as u16,
+                h as u16,
+                (hot.x * scale).round() as u16,
+                (hot.y * scale).round() as u16,
+                &rgba,
+            );
         });
     }
 }

@@ -23,6 +23,10 @@ pub struct EncoderConfig {
     pub crf: f32,
     /// VBV cap in kbit/s (0 = uncapped).
     pub max_kbps: u32,
+    /// Number of reference frames (1 = ultrafast default; 3-4 cuts modal/tab re-encoding).
+    pub ref_frames: u32,
+    /// Motion estimation search range in pixels (64 default; 96-128 helps low-fps scrolls).
+    pub me_range: u32,
 }
 
 pub struct Encoder {
@@ -70,6 +74,7 @@ impl Encoder {
             param.i_scenecut_threshold = 0;
             param.b_intra_refresh = 0;
             param.i_bframe = 0;
+            param.i_frame_reference = cfg.ref_frames.clamp(1, 16) as i32;
             param.b_annexb = 1;
             param.b_repeat_headers = 1;
             param.b_aud = 0;
@@ -88,7 +93,7 @@ impl Encoder {
             // window or a fast scroll would be coded as new pixels every frame. UMH finds
             // those shifts (a third of the bits for a window drag) for about the same CPU.
             param.analyse.i_me_method = ffi::X264_ME_UMH as i32;
-            param.analyse.i_me_range = 64;
+            param.analyse.i_me_range = cfg.me_range.clamp(16, 256) as i32;
             // Per-macroblock "unchanged" hints from X damage let x264 skip analysis.
             param.analyse.b_mb_info = (std::env::var("VOXL_NO_MBINFO").is_err()) as i32;
             param.i_sync_lookahead = 0;
@@ -268,6 +273,8 @@ mod bench {
                 threads,
                 crf: 24.0,
                 max_kbps: 30000,
+                ref_frames: 1,
+                me_range: 64,
             })
             .unwrap();
             let mut y = vec![0u8; w * h];

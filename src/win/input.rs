@@ -266,13 +266,15 @@ impl Injector {
             .any(|(&ks, &v)| ks != 0xfe03 && !matches!(v, VK_LSHIFT | VK_RSHIFT))
     }
 
-    /// Pixels on the virtual desktop -> SendInput's absolute 0..65535 range.
+    /// Pixels on the streamed desktop -> SendInput's absolute 0..65535 range.
     fn absolute(&self, x: i32, y: i32) -> (i32, i32) {
         let g = super::GEOMETRY.lock().unwrap_or(super::Geometry {
             left: 0,
             top: 0,
             width: 1,
             height: 1,
+            stream_width: 1,
+            stream_height: 1,
         });
         let (vx, vy, vw, vh) = unsafe {
             (
@@ -282,8 +284,22 @@ impl Injector {
                 GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
             )
         };
-        let px = (g.left + x.clamp(0, g.width as i32 - 1) - vx) as i64;
-        let py = (g.top + y.clamp(0, g.height as i32 - 1) - vy) as i64;
+        let sw = g.stream_width.max(1) as i64;
+        let sh = g.stream_height.max(1) as i64;
+        let cx = x.clamp(0, g.stream_width.saturating_sub(1) as i32) as i64;
+        let cy = y.clamp(0, g.stream_height.saturating_sub(1) as i32) as i64;
+        let dx = if g.stream_width == g.width {
+            cx
+        } else {
+            ((cx * g.width as i64 + sw / 2) / sw).clamp(0, g.width.saturating_sub(1) as i64)
+        };
+        let dy = if g.stream_height == g.height {
+            cy
+        } else {
+            ((cy * g.height as i64 + sh / 2) / sh).clamp(0, g.height.saturating_sub(1) as i64)
+        };
+        let px = g.left as i64 + dx - vx as i64;
+        let py = g.top as i64 + dy - vy as i64;
         // Windows maps n back to n * size / 65536 pixels; aim at the pixel's centre.
         (
             ((px * 65536 + 32768) / vw as i64) as i32,
@@ -336,9 +352,13 @@ impl Injector {
                 send(&v);
             }
             InputEvent::ScrollPx { dx, dy } => {
-                // Desktop pixels -> wheel units (120 per notch); apps that support
-                // high-resolution wheels scroll by fractions of a notch.
-                let k = WHEEL_DELTA as f64 / self.px_per_notch.max(1.0);
+                // Desktop pixels -> wheel units (120 per notch); scale up when capture
+                // downscaling is active so physical scroll distance stays consistent.
+                let scale = super::GEOMETRY
+                    .lock()
+                    .map(|g| g.width as f64 / g.stream_width.max(1) as f64)
+                    .unwrap_or(1.0);
+                let k = (WHEEL_DELTA as f64 * scale) / self.px_per_notch.max(1.0);
                 self.scroll_acc.0 += dx * k;
                 self.scroll_acc.1 -= dy * k;
                 let (x, y) = (self.scroll_acc.0.trunc(), self.scroll_acc.1.trunc());

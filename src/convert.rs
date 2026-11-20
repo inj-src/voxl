@@ -15,6 +15,22 @@ extern "C" {
         width: i32,
         height: i32,
     ) -> i32;
+
+    fn ARGBScaleClip(
+        src_argb: *const u8,
+        src_stride_argb: i32,
+        src_width: i32,
+        src_height: i32,
+        dst_argb: *mut u8,
+        dst_stride_argb: i32,
+        dst_width: i32,
+        dst_height: i32,
+        clip_x: i32,
+        clip_y: i32,
+        clip_width: i32,
+        clip_height: i32,
+        filtering: i32,
+    ) -> i32;
 }
 
 pub struct I420 {
@@ -114,6 +130,105 @@ pub fn convert_band(
         );
     };
     split_rows(y0, y1, threads, run);
+}
+
+/// Scale `src` (`src_w` x `src_h` BGRX) to `dst.width` x `dst_h` for destination rows
+/// `[y0, y1)` (even-aligned) and convert into `dst` (I420), using libyuv box filtering.
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn convert_scaled_band(
+    src: &[u8],
+    src_stride: usize,
+    src_w: usize,
+    src_h: usize,
+    dst: &mut I420,
+    dst_h: usize,
+    y0: usize,
+    y1: usize,
+    threads: usize,
+) {
+    let rows = y1.saturating_sub(y0);
+    if rows == 0 {
+        return;
+    }
+    let dw = dst.width;
+    let dstride = dw * 4;
+    let suv = dst.stride_uv();
+    let (yp, up, vp) = (
+        SendPtr(dst.y.as_mut_ptr()),
+        SendPtr(dst.u.as_mut_ptr()),
+        SendPtr(dst.v.as_mut_ptr()),
+    );
+    let src_p = SendPtr(src.as_ptr() as *mut u8);
+    // kFilterBox = 3: crisp box-filter downscaling for UI text.
+    const K_FILTER_BOX: i32 = 3;
+    let run = |a: usize, b: usize| {
+        let ch = b - a;
+        let mut tmp = vec![0u8; dstride * ch];
+        unsafe {
+            ARGBScaleClip(
+                src_p.get(),
+                src_stride as i32,
+                src_w as i32,
+                src_h as i32,
+                tmp.as_mut_ptr(),
+                dstride as i32,
+                dw as i32,
+                dst_h as i32,
+                0,
+                a as i32,
+                dw as i32,
+                ch as i32,
+                K_FILTER_BOX,
+            );
+            ARGBToI420(
+                tmp.as_ptr(),
+                dstride as i32,
+                yp.get().add(a * dw),
+                dw as i32,
+                up.get().add((a / 2) * suv),
+                suv as i32,
+                vp.get().add((a / 2) * suv),
+                suv as i32,
+                dw as i32,
+                ch as i32,
+            );
+        }
+    };
+    split_rows(y0, y1, threads, run);
+}
+
+/// Scale a full BGRX frame into `dst` (used by screenshots when capture downscaling is on).
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn scale_bgrx(
+    src: &[u8],
+    src_stride: usize,
+    src_w: usize,
+    src_h: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_w: usize,
+    dst_h: usize,
+) {
+    const K_FILTER_BOX: i32 = 3;
+    unsafe {
+        ARGBScaleClip(
+            src.as_ptr(),
+            src_stride as i32,
+            src_w as i32,
+            src_h as i32,
+            dst.as_mut_ptr(),
+            dst_stride as i32,
+            dst_w as i32,
+            dst_h as i32,
+            0,
+            0,
+            dst_w as i32,
+            dst_h as i32,
+            K_FILTER_BOX,
+        );
+    }
 }
 
 /// Copy rows [y0, y1) (even-aligned) of an NV12 frame into `dst`: the luma rows as

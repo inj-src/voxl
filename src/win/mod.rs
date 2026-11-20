@@ -30,13 +30,16 @@ use windows::Win32::UI::HiDpi::{
 };
 
 /// Where the captured display sits on the virtual desktop, in physical pixels (voxl is
-/// per-monitor DPI aware, so these are the pixels it streams).
+/// per-monitor DPI aware), plus the encoded stream dimensions when capture-side
+/// downscaling (`--max-width` / `--capture-scale`) is active.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Geometry {
     pub left: i32,
     pub top: i32,
     pub width: u32,
     pub height: u32,
+    pub stream_width: u32,
+    pub stream_height: u32,
 }
 
 /// Set by the capturer whenever it (re)starts; read by input to map coordinates.
@@ -45,9 +48,34 @@ pub static GEOMETRY: Mutex<Option<Geometry>> = Mutex::new(None);
 struct Settings {
     /// Index into `outputs()` (0 is the primary display).
     display: usize,
+    /// Optional capture-side scale factor (0.25..=1.0), without changing the physical monitor.
+    capture_scale: Option<f64>,
+    /// Optional maximum encoded stream width in pixels (e.g. 1280), preserving aspect ratio.
+    max_width: Option<u32>,
 }
 
-static SETTINGS: Mutex<Settings> = Mutex::new(Settings { display: 0 });
+static SETTINGS: Mutex<Settings> = Mutex::new(Settings {
+    display: 0,
+    capture_scale: None,
+    max_width: None,
+});
+
+/// Stream dimensions (even-aligned, never upscaled) for a physical display of `w`x`h`.
+pub fn capture_size(w: u32, h: u32) -> (u32, u32) {
+    let s = SETTINGS.lock();
+    let mut scale = s.capture_scale.unwrap_or(1.0).clamp(0.25, 1.0);
+    if let Some(mw) = s.max_width {
+        if mw > 0 && w > mw {
+            scale = scale.min(mw as f64 / w as f64);
+        }
+    }
+    if scale >= 0.999 {
+        return ((w & !1).max(2), (h & !1).max(2));
+    }
+    let sw = (((w as f64 * scale).round() as u32) & !1).clamp(320, (w & !1).max(2));
+    let sh = (((h as f64 * scale).round() as u32) & !1).clamp(240, (h & !1).max(2));
+    (sw, sh)
+}
 
 /// One display attached to the desktop.
 pub struct Output {
@@ -136,6 +164,16 @@ pub fn init(a: &HashMap<String, String>) {
             s.display = n;
         } else {
             log::warn!("no display {n}; using the primary display");
+        }
+    }
+    if let Some(scale) = a.get("capture-scale").and_then(|v| v.parse::<f64>().ok()) {
+        if scale > 0.0 {
+            s.capture_scale = Some(scale.clamp(0.25, 1.0));
+        }
+    }
+    if let Some(mw) = a.get("max-width").and_then(|v| v.parse::<u32>().ok()) {
+        if mw >= 320 {
+            s.max_width = Some(mw);
         }
     }
 }

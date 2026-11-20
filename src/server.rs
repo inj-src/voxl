@@ -224,9 +224,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     };
     log::info!("client {} connected", client.id);
     client.send(Out::Text(s.hub.hello()));
-    if let Some(c) = s.hub.cursor.lock().clone() {
-        client.send(Out::Bin(c));
-    }
+    s.hub.send_current_cursor(&client);
     let writer = tokio::spawn(async move {
         let dbg = std::env::var("VOXL_DEBUG_MARKER").is_ok();
         while let Some(m) = rx.recv().await {

@@ -30,9 +30,14 @@ Login:
 Video:
   --framerate                   max frames per second (default 60)
   --crf                         base quality (default 24)
-  --max-kbps, --min-kbps        adaptive bitrate ceiling and floor
-                                (default 30000, 2000)
+  --max-kbps, --min-kbps, --start-kbps
+                                adaptive bitrate ceiling, floor and initial cap
+                                (default 30000, 2000, 8000)
   --preset                      x264 preset (default ultrafast)
+  --ref-frames                  x264 reference frames (default 1)
+  --me-range                    x264 motion search range in pixels (default 64)
+  --motion-quality              keep drags/scrolls at base CRF (default true)
+  --adaptive-fps                step capture FPS down under congestion (default false)
   --encoder-threads             x264 sliced threads (default min(4, cores/4))
   --adaptive-threads            encode on one thread, fanning out only under
                                 sustained heavy motion (default false)
@@ -95,7 +100,12 @@ Desktop (this Mac's screen):
 const DESKTOP: &str = "
 Desktop (this PC's screen):
   --display                     display to stream, by index (0 is the primary)
+  --capture-scale               capture-side scale factor 0.25..1.0 without
+                                changing the monitor mode (default 1.0)
+  --max-width                   cap streamed width in pixels, keeping aspect ratio
   --enable-clipboard            true, in, out or false (default true)
+  --max-clipboard-image-kb      largest outbound clipboard image in KB, 0 to disable
+                                (default 15360)
   --audio-enabled               system audio (default true)
   --audio-device-name           output device whose sound to stream
                                 (default: the default output device)

@@ -22,6 +22,7 @@ pub struct VideoConfig {
     pub convert_threads: usize,
     pub crf: f32,
     pub max_kbps: u32,
+    pub start_kbps: u32,
     pub paintover_crf: f32,
     pub paintover_burst: u32,
     pub paintover_delay_ms: u64,
@@ -29,6 +30,10 @@ pub struct VideoConfig {
     pub coalesce: Duration,
     pub stripes: u32,
     pub adaptive_threads: bool,
+    pub ref_frames: u32,
+    pub me_range: u32,
+    pub motion_quality: bool,
+    pub adaptive_fps: bool,
 }
 
 struct Job {
@@ -203,6 +208,8 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
             threads: fixed,
             crf: cfg.crf,
             max_kbps: cfg.max_kbps,
+            ref_frames: cfg.ref_frames,
+            me_range: cfg.me_range,
         };
         let max_threads = if cfg.adaptive_threads {
             (cfg.threads / layout.len() as u32).max(1)
@@ -221,10 +228,22 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     }
     *hub.stripes.lock() = layout;
     let hub2 = hub.clone();
-    let (crf, po_crf) = (cfg.crf, cfg.paintover_crf);
+    let (crf, po_crf, min_kbps, motion_quality) =
+        (cfg.crf, cfg.paintover_crf, cfg.min_kbps, cfg.motion_quality);
     let encode = std::thread::Builder::new()
         .name("encode".into())
-        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf))
+        .spawn(move || {
+            encode_loop(
+                stripes,
+                job_rx,
+                ret_tx,
+                hub2,
+                crf,
+                po_crf,
+                min_kbps,
+                motion_quality,
+            )
+        })
         .unwrap();
     #[cfg(target_os = "macos")]
     {
@@ -251,6 +270,14 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
 }
 
 fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
+    let target_kbps = hub.target_kbps.load(Ordering::Relaxed);
+    // On slow uplinks (<1 Mbps), a legitimate keyframe or dense delta can take >4 s
+    // to cross the link; resyncing at 4 s causes an infinite keyframe loop.
+    let stall_ms: u128 = if target_kbps > 0 && target_kbps < 1000 {
+        12_000
+    } else {
+        4_000
+    };
     for c in hub.video_clients() {
         let (n, age) = c.backlog();
         if n == 0 {
@@ -263,7 +290,7 @@ fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
         // Enough frames in flight to cover one RTT plus decode, but never more than ~rtt+120ms of queue.
         let max_n = (((rtt + 40.0) / interval_ms).ceil() as usize + 2).clamp(3, 40);
         let max_age = rtt as u128 + 120;
-        if age > 4000 {
+        if age > stall_ms {
             // Stalled client (hidden tab, dead socket): stop letting it gate everyone.
             log::warn!(
                 "client {} stalled ({} frames, {} ms); resyncing",
@@ -298,16 +325,14 @@ struct RateCtl {
     /// Delivery rate observed at the last congestion: the path's likely capacity.
     ceiling: f64,
     ceiling_at: Instant,
+    congested: bool,
 }
 
-/// Starting point for a new session's bitrate cap (kbit/s).
-const START_KBPS: f64 = 8000.0;
-
 impl RateCtl {
-    fn new(max: f64, min: f64) -> Self {
+    fn new(max: f64, min: f64, start: f64) -> Self {
         let past = Instant::now() - Duration::from_secs(10);
         RateCtl {
-            target: START_KBPS.min(max),
+            target: start.clamp(min, max),
             max,
             min,
             last_eval: past,
@@ -316,7 +341,24 @@ impl RateCtl {
             slow_start: true,
             ceiling: f64::MAX,
             ceiling_at: past,
+            congested: false,
         }
+    }
+
+    /// Capture FPS ceiling adjusted for current bandwidth target and congestion.
+    fn effective_fps(&self, base_fps: u32) -> u32 {
+        let mut fps = base_fps.max(1);
+        if self.target < 350.0 {
+            fps = fps.min(8);
+        } else if self.target < 600.0 {
+            fps = fps.min(12);
+        } else if self.target < 1000.0 {
+            fps = fps.min(15);
+        }
+        if self.congested {
+            fps = (fps / 2).max(6).min(base_fps.max(1));
+        }
+        fps
     }
 
     fn update(&mut self, hub: &Hub, clients: &[Arc<crate::hub::Client>]) {
@@ -411,6 +453,8 @@ impl RateCtl {
                 self.last_inc = now;
             }
         }
+        self.congested = congested;
+        hub.congested.store(congested, Ordering::Relaxed);
         hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
     }
 }
@@ -540,13 +584,14 @@ fn capture_loop(
     let mut pending: [Option<Band>; 2] = [Some(cap.full()), Some(cap.full())];
     let mut next_idx = 0usize;
     let interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
-    // Allow slight early capture so source jitter doesn't alias into dropped frames.
-    let min_interval = interval.mul_f64(0.85);
-    let interval_ms = interval.as_secs_f64() * 1000.0;
     let mut last_capture = Instant::now() - interval;
     let mut last_motion = Instant::now();
     let mut paintover_left = 0u32;
-    let mut rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64);
+    let mut rc = RateCtl::new(
+        cfg.max_kbps as f64,
+        cfg.min_kbps as f64,
+        cfg.start_kbps as f64,
+    );
     hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
     let mut had_clients = false;
     let mut full_next = true;
@@ -592,7 +637,12 @@ fn capture_loop(
         let clients = hub.video_clients();
         if clients.is_empty() {
             if had_clients {
-                rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64);
+                rc = RateCtl::new(
+                    cfg.max_kbps as f64,
+                    cfg.min_kbps as f64,
+                    cfg.start_kbps as f64,
+                );
+                hub.congested.store(false, Ordering::Relaxed);
                 hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
             }
             had_clients = false;
@@ -600,6 +650,14 @@ fn capture_loop(
             continue;
         }
         rc.update(&hub, &clients);
+        let eff_fps = if cfg.adaptive_fps {
+            rc.effective_fps(cfg.fps)
+        } else {
+            cfg.fps
+        };
+        let eff_interval = Duration::from_secs_f64(1.0 / eff_fps.max(1) as f64);
+        let eff_min_interval = eff_interval.mul_f64(0.85);
+        let eff_interval_ms = eff_interval.as_secs_f64() * 1000.0;
         let want_key = clients
             .iter()
             .any(|c| c.needs_keyframe.load(Ordering::Relaxed));
@@ -612,6 +670,7 @@ fn capture_loop(
             full_next = true;
         }
         let paintover_due = paintover_left > 0
+            && !rc.congested
             && last_motion.elapsed() >= Duration::from_millis(cfg.paintover_delay_ms);
         if !cap.damaged && !want_key && !paintover_due {
             let timeout = if paintover_left == 0 {
@@ -625,8 +684,8 @@ fn capture_loop(
             continue;
         }
         let since = last_capture.elapsed();
-        if since < min_interval {
-            let rem = min_interval - since;
+        if since < eff_min_interval {
+            let rem = eff_min_interval - since;
             wait_any(
                 &[hub.waker.waitable()],
                 (rem.as_micros() as i32 + 999) / 1000,
@@ -643,7 +702,7 @@ fn capture_loop(
                 continue;
             }
         }
-        if !want_key && !flow_ok(&hub, interval_ms) {
+        if !want_key && !flow_ok(&hub, eff_interval_ms) {
             hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
             wait_any(&[cap.fd(), hub.waker.waitable()], 4);
             continue;
@@ -736,8 +795,13 @@ fn capture_loop(
         let paintover = if is_motion {
             last_motion = Instant::now();
             paintover_left = cfg.paintover_burst;
-            // Piggyback sharpening of blocks that have gone still on this frame.
-            refine = if want_key { None } else { refiner.due() };
+            // Piggyback sharpening of blocks that have gone still on this frame, unless
+            // the link is currently congested.
+            refine = if want_key || rc.congested || cfg.paintover_burst == 0 {
+                None
+            } else {
+                refiner.due()
+            };
             refine.is_some()
         } else if paintover_due {
             paintover_left -= 1;
@@ -1040,6 +1104,7 @@ fn stripe_worker(
     rx: mpsc::Receiver<StripeJob>,
     done: mpsc::Sender<StripeResult>,
     debug: bool,
+    motion_quality: bool,
 ) {
     let mut gov = ThreadGovernor {
         threads: 1,
@@ -1054,17 +1119,24 @@ fn stripe_worker(
     while let Ok(job) = rx.recv() {
         let buf = unsafe { &*job.buf.0 };
         let is_motion = !job.force_idr && !job.paintover;
-        let crf = if is_motion {
+        let crf = if is_motion && motion_quality {
             motion.crf(job.crf)
         } else {
             job.crf
         };
         if job.force_idr {
-            // A keyframe is what a new viewer sees first; don't starve it to the
-            // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
-            let boost = job.cap.saturating_mul(4).max(16_000);
-            s.enc
-                .set_rate_buf(job.crf, boost, boost / s.cfg.fps.max(1) * 8);
+            // A keyframe is what a new viewer sees first. On LAN/fast links give it up to
+            // ~8 frames at 4x the cap; on constrained uplinks (<4 Mbps) keep the single IDR
+            // within ~1.25 s of the link cap so it does not trip the stall resync loop.
+            if job.cap >= 4_000 {
+                let boost = job.cap.saturating_mul(4).max(16_000);
+                s.enc
+                    .set_rate_buf(job.crf, boost, boost / s.cfg.fps.max(1) * 8);
+            } else {
+                let boost = job.cap.saturating_mul(2).max(400);
+                let buf_kbit = (job.cap * 5 / 4).max(120);
+                s.enc.set_rate_buf(job.crf, boost, buf_kbit);
+            }
             s.applied_kbps = 0;
         } else {
             let moved = s.applied_kbps == 0
@@ -1168,6 +1240,7 @@ fn stripe_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_loop(
     stripes_in: Vec<Stripe>,
     rx: mpsc::Receiver<Job>,
@@ -1175,6 +1248,8 @@ fn encode_loop(
     hub: Arc<Hub>,
     crf: f32,
     po_crf: f32,
+    min_kbps: u32,
+    motion_quality: bool,
 ) {
     let epoch = Instant::now();
     let mut frame_id: u32 = 0;
@@ -1192,7 +1267,7 @@ fn encode_loop(
             let done = done_tx.clone();
             let h = std::thread::Builder::new()
                 .name(format!("enc-{i}"))
-                .spawn(move || stripe_worker(i, s, rx, done, debug_stripes))
+                .spawn(move || stripe_worker(i, s, rx, done, debug_stripes, motion_quality))
                 .unwrap();
             (tx, h)
         })
@@ -1214,17 +1289,29 @@ fn encode_loop(
             continue;
         }
         let target = hub.target_kbps.load(Ordering::Relaxed);
-        let want_crf = if job.paintover { po_crf } else { crf };
-        // Each stripe may use up to twice its area share of the budget; the delay-based
-        // controller reins the total in if several stripes move at once.
-        let share = ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32;
+        let congested = hub.congested.load(Ordering::Relaxed);
+        let want_crf = if job.paintover {
+            po_crf
+        } else if congested && target <= min_kbps.saturating_mul(3) / 2 {
+            // Smoothly raise QP when pinned near the floor instead of letting VBV slam QP 51.
+            (crf + 4.0).min(38.0)
+        } else {
+            crf
+        };
+        // With 1 stripe, use the exact target; with multiple stripes, each may use up to
+        // twice its area share while the delay-based controller reins the total in.
+        let share = if n == 1 {
+            target.max(1)
+        } else {
+            ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
+        };
         let ts = job.captured_at.duration_since(epoch).as_millis() as i64;
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
         let buf_ptr = SendPtr(&*job.buf as *const I420);
         let mut pending = 0;
         for (i, &on) in selected.iter().enumerate() {
             if on {
-                let cap = if job.paintover {
+                let cap = if job.paintover && target >= 2_000 {
                     share.saturating_mul(2)
                 } else {
                     share
@@ -1483,6 +1570,8 @@ mod tests {
                     threads: 1,
                     crf,
                     max_kbps,
+                    ref_frames: 1,
+                    me_range: 64,
                 })
                 .unwrap(),
                 motion: MotionQuality::default(),

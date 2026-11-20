@@ -164,6 +164,7 @@ async fn serve(a: HashMap<String, String>) {
         crf: range_max(a.get("crf"), 24.0) as f32,
         // Selkies' --video-bitrate becomes the ceiling for adaptive bitrate.
         max_kbps: range_max(a.get("max-kbps").or(a.get("video-bitrate")), 30000.0) as u32,
+        start_kbps: range_max(a.get("start-kbps"), 8000.0) as u32,
         paintover_crf: range_max(a.get("paintover-crf"), 16.0) as f32,
         paintover_burst: range_max(a.get("paintover-burst"), 3.0) as u32,
         paintover_delay_ms: range_max(a.get("paintover-delay-ms"), 150.0) as u64,
@@ -174,6 +175,10 @@ async fn serve(a: HashMap<String, String>) {
         // small updates encode a few ms slower on one thread.
         adaptive_threads: truthy(a.get("adaptive-threads"), false),
         coalesce: std::time::Duration::from_micros(range_max(a.get("coalesce-us"), 0.0) as u64),
+        ref_frames: range_max(a.get("ref-frames"), 1.0) as u32,
+        me_range: range_max(a.get("me-range"), 64.0) as u32,
+        motion_quality: truthy(a.get("motion-quality"), true),
+        adaptive_fps: truthy(a.get("adaptive-fps"), false),
     };
     let clip = a
         .get("enable-clipboard")
@@ -191,6 +196,9 @@ async fn serve(a: HashMap<String, String>) {
     };
 
     let hub = hub::Hub::new();
+    let max_clip_img_kb = range_max(a.get("max-clipboard-image-kb"), 15360.0) as u64;
+    hub.max_clipboard_image_bytes
+        .store(max_clip_img_kb.saturating_mul(1024), std::sync::atomic::Ordering::Relaxed);
     // --read-only: the viewer watches the desktop, it does not drive it. Only the
     // commands watching needs are accepted (see server::READ_ONLY_COMMANDS), uploads
     // are refused, and the page hides the controls that would send anything else.

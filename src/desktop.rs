@@ -331,7 +331,10 @@ fn hash(data: &[u8]) -> u64 {
 
 fn publish(hub: &Hub, atoms: &Atoms, target: u32, data: Vec<u8>, last_image: &mut Option<u64>) {
     if target == atoms.png {
-        if data.is_empty() || data.len() > MAX_IMAGE {
+        let max_img = hub
+            .max_clipboard_image_bytes
+            .load(std::sync::atomic::Ordering::Relaxed) as usize;
+        if max_img == 0 || data.is_empty() || data.len() > MAX_IMAGE.min(max_img) {
             return;
         }
         let h = hash(&data);
@@ -368,14 +371,7 @@ fn send_cursor(conn: &RustConnection, hub: &Hub) {
         return;
     };
     let (w, h) = (img.width as usize, img.height as usize);
-    let mut msg = Vec::with_capacity(14 + w * h * 4);
-    msg.push(0x03);
-    msg.push(0);
-    msg.extend_from_slice(&(w as u16).to_be_bytes());
-    msg.extend_from_slice(&(h as u16).to_be_bytes());
-    msg.extend_from_slice(&img.xhot.to_be_bytes());
-    msg.extend_from_slice(&img.yhot.to_be_bytes());
-    msg.extend_from_slice(&img.cursor_serial.to_be_bytes());
+    let mut rgba = Vec::with_capacity(w * h * 4);
     for &p in img.cursor_image.iter().take(w * h) {
         let a = (p >> 24) & 0xff;
         let un = |c: u32| {
@@ -385,14 +381,12 @@ fn send_cursor(conn: &RustConnection, hub: &Hub) {
                 ((c * 255 + a / 2) / a).min(255) as u8
             }
         };
-        msg.extend_from_slice(&[
+        rgba.extend_from_slice(&[
             un((p >> 16) & 0xff),
             un((p >> 8) & 0xff),
             un(p & 0xff),
             a as u8,
         ]);
     }
-    let b = Bytes::from(msg);
-    *hub.cursor.lock() = Some(b.clone());
-    hub.broadcast(|| Out::Bin(b.clone()));
+    hub.publish_cursor(w as u16, h as u16, img.xhot, img.yhot, &rgba);
 }

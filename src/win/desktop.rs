@@ -318,6 +318,10 @@ fn clipboard_loop(hub: Arc<Hub>, state: Arc<Mutex<ClipState>>) {
             hub.broadcast(|| Out::Text(msg.clone()));
             continue;
         }
+        let max_img = hub.max_clipboard_image_bytes.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        if max_img == 0 {
+            continue;
+        }
         let data = if has(png) {
             unsafe { get(png) }
         } else if has(CF_DIB.0 as u32) {
@@ -330,7 +334,7 @@ fn clipboard_loop(hub: Arc<Hub>, state: Arc<Mutex<ClipState>>) {
         let Some(data) = data else {
             continue;
         };
-        if data.is_empty() || data.len() > MAX_IMAGE {
+        if data.is_empty() || data.len() > MAX_IMAGE.min(max_img) {
             continue;
         }
         let h = hash(&data);
@@ -479,7 +483,6 @@ fn cursor_image(c: HICON) -> Option<(usize, usize, u32, u32, Vec<u8>)> {
 fn cursor_loop(hub: Arc<Hub>) {
     super::follow_input_desktop();
     let mut last: Option<(isize, bool)> = None;
-    let mut serial = 0u32;
     loop {
         std::thread::sleep(Duration::from_millis(16));
         if hub.clients.lock().is_empty() {
@@ -508,19 +511,7 @@ fn cursor_loop(hub: Arc<Hub>) {
         } else {
             (1, 1, 0, 0, vec![0; 4])
         };
-        serial = serial.wrapping_add(1);
-        let mut msg = Vec::with_capacity(14 + rgba.len());
-        msg.push(0x03);
-        msg.push(0);
-        msg.extend_from_slice(&(w as u16).to_be_bytes());
-        msg.extend_from_slice(&(h as u16).to_be_bytes());
-        msg.extend_from_slice(&(hx as u16).to_be_bytes());
-        msg.extend_from_slice(&(hy as u16).to_be_bytes());
-        msg.extend_from_slice(&serial.to_be_bytes());
-        msg.extend_from_slice(&rgba);
-        let b = Bytes::from(msg);
-        *hub.cursor.lock() = Some(b.clone());
-        hub.broadcast(|| Out::Bin(b.clone()));
+        hub.publish_cursor(w as u16, h as u16, hx as u16, hy as u16, &rgba);
     }
 }
 

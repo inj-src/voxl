@@ -69,6 +69,8 @@ pub fn spawn(device: String, bitrate: i32, hub: Arc<Hub>) {
                 return;
             }
             opus_encoder_ctl(enc, 4002, bitrate as c_int);
+            // OPUS_SET_DTX_REQUEST (4016): save bandwidth during silent passages.
+            opus_encoder_ctl(enc, 4016, 1 as c_int);
             let name = c"voxl";
             let dev = CString::new(device).unwrap();
             let ss = PaSampleSpec {
@@ -126,7 +128,7 @@ pub fn spawn(device: String, bitrate: i32, hub: Arc<Hub>) {
                     if checked % 50 == 0 && !want() {
                         break;
                     }
-                    if pcm.iter().all(|&s| s == 0) {
+                    if pcm.iter().all(|&s| s.unsigned_abs() <= 8) {
                         continue;
                     }
                     let n = opus_encode(

@@ -59,7 +59,8 @@ impl Encoder {
         );
         while self.pending.len() >= FRAME * 2 {
             let pcm: Vec<i16> = self.pending.drain(..FRAME * 2).collect();
-            if pcm.iter().all(|&s| s == 0) {
+            // Small noise gate (-72 dBFS) suppresses WASAPI near-silent dither/hum.
+            if pcm.iter().all(|&s| s.unsigned_abs() <= 8) {
                 continue;
             }
             let n = unsafe {
@@ -241,7 +242,11 @@ pub fn spawn(device_name: String, bitrate: i32, hub: Arc<Hub>) {
                 log::error!("opus init failed: {err}");
                 return;
             }
-            unsafe { opus_encoder_ctl(enc, 4002, bitrate as c_int) };
+            unsafe {
+                opus_encoder_ctl(enc, 4002, bitrate as c_int);
+                // OPUS_SET_DTX_REQUEST (4016): save bandwidth during silent passages.
+                opus_encoder_ctl(enc, 4016, 1 as c_int);
+            };
             let mut encoder = Encoder {
                 enc,
                 pending: Vec::with_capacity(FRAME * 4),
