@@ -162,40 +162,53 @@ pub fn convert_scaled_band(
     let src_p = SendPtr(src.as_ptr() as *mut u8);
     // kFilterBox = 3: crisp box-filter downscaling for UI text.
     const K_FILTER_BOX: i32 = 3;
-    let run = |a: usize, b: usize| {
-        let ch = b - a;
-        let mut tmp = vec![0u8; dstride * ch];
-        unsafe {
-            ARGBScaleClip(
-                src_p.get(),
-                src_stride as i32,
-                src_w as i32,
-                src_h as i32,
-                tmp.as_mut_ptr(),
-                dstride as i32,
-                dw as i32,
-                dst_h as i32,
-                0,
-                a as i32,
-                dw as i32,
-                ch as i32,
-                K_FILTER_BOX,
-            );
-            ARGBToI420(
-                tmp.as_ptr(),
-                dstride as i32,
-                yp.get().add(a * dw),
-                dw as i32,
-                up.get().add((a / 2) * suv),
-                suv as i32,
-                vp.get().add((a / 2) * suv),
-                suv as i32,
-                dw as i32,
-                ch as i32,
-            );
+    // ARGBScaleClip writes to `dst_argb + clip_y * dst_stride_argb`, so `scratch` must
+    // span the full destination height (`dst_h`). Keep a thread-local buffer on the
+    // capture thread to avoid allocating and faulting a multi-MB Vec on every frame.
+    std::thread_local! {
+        static SCALE_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    SCALE_BUF.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let need = dstride * dst_h;
+        if scratch.len() < need {
+            scratch.resize(need, 0);
         }
-    };
-    split_rows(y0, y1, threads, run);
+        let tmp = SendPtr(scratch.as_mut_ptr());
+        let run = |a: usize, b: usize| {
+            let ch = b - a;
+            unsafe {
+                ARGBScaleClip(
+                    src_p.get(),
+                    src_stride as i32,
+                    src_w as i32,
+                    src_h as i32,
+                    tmp.get(),
+                    dstride as i32,
+                    dw as i32,
+                    dst_h as i32,
+                    0,
+                    a as i32,
+                    dw as i32,
+                    ch as i32,
+                    K_FILTER_BOX,
+                );
+                ARGBToI420(
+                    tmp.get().add(a * dstride),
+                    dstride as i32,
+                    yp.get().add(a * dw),
+                    dw as i32,
+                    up.get().add((a / 2) * suv),
+                    suv as i32,
+                    vp.get().add((a / 2) * suv),
+                    suv as i32,
+                    dw as i32,
+                    ch as i32,
+                );
+            }
+        };
+        split_rows(y0, y1, threads, run);
+    });
 }
 
 /// Scale a full BGRX frame into `dst` (used by screenshots when capture downscaling is on).
