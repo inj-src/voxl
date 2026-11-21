@@ -352,7 +352,8 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
         }
         "a" => {
             if let Some(id) = num::<u32>(&mut it) {
-                c.on_ack(id, num::<f64>(&mut it).unwrap_or(0.0));
+                let hold = num::<f64>(&mut it).unwrap_or(0.0);
+                c.on_ack(id, hold, num::<f64>(&mut it));
                 s.hub.wake();
             }
         }

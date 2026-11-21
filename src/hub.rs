@@ -64,8 +64,8 @@ const LINK_SAMPLE_MIN_BYTES: usize = 12_500;
 /// Shortest delivery time a sample is credited with, and the closest two frames may
 /// arrive and still count: a retransmit releases several at once.
 const LINK_SAMPLE_MIN_MS: f64 = 10.0;
-/// An added-up sample of small frames carries each frame's RTT jitter, so it reads low;
-/// it revokes fast only under this.
+/// An added-up sample of small frames carries each frame's RTT jitter, so it reads low:
+/// it revokes fast only under this, and at or above it keeps existing fast evidence fresh.
 const LINK_POOL_SLOW_KBPS: u32 = 1000;
 /// Fast evidence counts this long; without fresh evidence the viewer is unmeasured.
 const LINK_WINDOW: Duration = Duration::from_secs(2);
@@ -75,6 +75,11 @@ const LINK_WINDOW: Duration = Duration::from_secs(2);
 pub struct LinkEst {
     /// When the last acked frame reached the viewer (ack time minus its hold).
     last_arrival: Option<Instant>,
+    /// The same arrival on the viewer's clock (ms), if the viewer reports it.
+    last_arrival_v: Option<f64>,
+    /// The viewer reports arrival times. Without them a frame that queued is timed from
+    /// a server stamp that return-path delay can make late, so it never counts as fast.
+    viewer_clock: bool,
     /// Frames too small to time alone, added up: bytes, delivery ms, first added.
     pool_bytes: usize,
     pool_ms: f64,
@@ -86,17 +91,32 @@ pub struct LinkEst {
 }
 
 impl LinkEst {
-    /// `whole`: one frame of `LINK_SAMPLE_MIN_BYTES` or more, or a small frame that
-    /// still read fast (jitter only lowers a sample, so a fast one is trustworthy).
+    /// `whole`: one frame of `LINK_SAMPLE_MIN_BYTES` or more; else small frames added up.
     fn record(&mut self, kbps: u32, whole: bool, now: Instant) {
+        self.fast
+            .retain(|&(_, t)| now.saturating_duration_since(t) <= LINK_WINDOW);
         if kbps >= SLOW_LINK_KBPS {
-            self.fast
-                .retain(|&(_, t)| now.saturating_duration_since(t) <= LINK_WINDOW);
-            self.fast.push_back((kbps, now));
-        } else if whole || kbps < LINK_POOL_SLOW_KBPS {
+            if self.viewer_clock {
+                self.fast.push_back((kbps, now));
+            }
+        } else if !whole && kbps >= LINK_POOL_SLOW_KBPS {
+            // Typing over a jittery relay: not evidence on its own, but no sign of a
+            // slow link either.
+            for e in self.fast.iter_mut() {
+                e.1 = now;
+            }
+        } else {
             self.fast.clear();
             self.slow_kbps = kbps;
         }
+    }
+
+    fn live_fast(&self) -> impl Iterator<Item = u32> + '_ {
+        let now = Instant::now();
+        self.fast
+            .iter()
+            .filter(move |&&(_, t)| now.saturating_duration_since(t) <= LINK_WINDOW)
+            .map(|&(k, _)| k)
     }
 
     fn clear_pool(&mut self) {
@@ -118,8 +138,11 @@ impl Client {
     }
 
     /// `hold_ms`: how long the viewer held the frame after its last part arrived (decode
-    /// and present), 0 from a viewer that does not say.
-    pub fn on_ack(&self, id: u32, hold_ms: f64) {
+    /// and present), 0 from a viewer that does not say. `arrived_v`: when that last part
+    /// arrived, on the viewer's clock (ms).
+    pub fn on_ack(&self, id: u32, hold_ms: f64, arrived_v: Option<f64>) {
+        // A frame read while draining may have waited many seconds: no delivery sample.
+        let draining = self.draining.load(Ordering::SeqCst);
         let mut q = self.inflight.lock();
         let mut acked = 0;
         let mut sample = None;
@@ -139,8 +162,8 @@ impl Client {
             }
         }
         drop(q);
-        if let (Some(first), Some(last)) = (first_sent, last_sent) {
-            self.sample_link([first, last], acked, hold_ms);
+        if let (Some(first), Some(last), false) = (first_sent, last_sent, draining) {
+            self.sample_link([first, last], acked, (hold_ms, arrived_v));
         }
         if self.stalled.load(Ordering::SeqCst)
             && wrapping_le(self.resync_id.load(Ordering::SeqCst), id)
@@ -180,10 +203,13 @@ impl Client {
     }
 
     /// Delivery rate of the frames just acked (`sent`: the first and the acked one):
-    /// their bytes over the time they took to arrive (bytes / (arrival - send - min RTT),
-    /// from the previous arrival if they queued behind it). Arrival is the ack time minus
-    /// the viewer's hold.
-    fn sample_link(&self, sent: [Instant; 2], bytes: usize, hold_ms: f64) {
+    /// their bytes over the time they took to arrive, arrival - send - min RTT. Arrival
+    /// is the ack time minus the viewer's hold (`viewer`: hold, arrival on its clock).
+    /// Frames that queued behind the previous ones are timed from the previous arrival,
+    /// on the viewer's clock, which a delayed or bunched ack can't shorten.
+    fn sample_link(&self, sent: [Instant; 2], bytes: usize, viewer: (f64, Option<f64>)) {
+        let (hold_ms, arrived_v) = viewer;
+        let arrived_v = arrived_v.filter(|v| v.is_finite());
         let now = Instant::now();
         // A hold as long as the whole round trip is wrong; it says nothing.
         let interval_ms = now.saturating_duration_since(sent[1]).as_secs_f64() * 1000.0;
@@ -193,9 +219,12 @@ impl Client {
         let arrived = now - Duration::from_secs_f64(hold_ms / 1000.0);
         let mut l = self.link.lock();
         let prev = l.last_arrival.replace(arrived);
-        if prev.is_some_and(|p| {
-            arrived.saturating_duration_since(p).as_secs_f64() * 1000.0 < LINK_SAMPLE_MIN_MS
-        }) {
+        let prev_v = std::mem::replace(&mut l.last_arrival_v, arrived_v);
+        l.viewer_clock = arrived_v.is_some();
+        let gap_v = arrived_v.zip(prev_v).map(|(a, p)| a - p);
+        let gap =
+            gap_v.or(prev.map(|p| arrived.saturating_duration_since(p).as_secs_f64() * 1000.0));
+        if gap.is_some_and(|g| g < LINK_SAMPLE_MIN_MS) {
             return;
         }
         // The smaller of the ping RTT and the fastest ack, so a high ping can't inflate it.
@@ -209,22 +238,21 @@ impl Client {
         } else {
             0.0
         };
-        let mut start = sent[0] + Duration::from_secs_f64(rtt_ms / 1000.0);
-        if let Some(p) = prev {
-            start = start.max(p);
-        }
-        // Arrived within the RTT baseline: too small to time, and no bytes are credited.
-        if arrived <= start {
-            return;
-        }
-        let ms = (arrived - start).as_secs_f64() * 1000.0;
+        let start = sent[0] + Duration::from_secs_f64(rtt_ms / 1000.0);
+        let since_start = arrived.saturating_duration_since(start).as_secs_f64() * 1000.0;
+        let ms = match (prev.filter(|&p| p > start), gap_v) {
+            // Both are at least the true delivery time; the viewer's gap is not shortened
+            // by return-path delay.
+            (Some(_), Some(g)) => g.min(since_start),
+            (Some(p), None) => (arrived - p).as_secs_f64() * 1000.0,
+            // Arrived within the RTT baseline: too small to time, and no bytes are credited.
+            (None, _) if arrived <= start => return,
+            (None, _) => since_start,
+        };
         let kbps = |b: usize, ms: f64| (b as f64 * 8.0 / ms.max(LINK_SAMPLE_MIN_MS)) as u32;
-        let one = kbps(bytes, ms);
-        if bytes >= LINK_SAMPLE_MIN_BYTES || one >= SLOW_LINK_KBPS {
-            l.record(one, true, now);
-            if bytes >= LINK_SAMPLE_MIN_BYTES {
-                return;
-            }
+        if bytes >= LINK_SAMPLE_MIN_BYTES {
+            l.record(kbps(bytes, ms), true, now);
+            return;
         }
         if l.pool_at
             .is_some_and(|t| now.saturating_duration_since(t) > LINK_WINDOW)
@@ -247,13 +275,14 @@ impl Client {
     /// counts as a slow link.
     pub fn link_kbps(&self) -> u32 {
         let l = self.link.lock();
-        let now = Instant::now();
-        l.fast
-            .iter()
-            .filter(|&&(_, t)| now.saturating_duration_since(t) <= LINK_WINDOW)
-            .map(|&(k, _)| k)
-            .max()
-            .unwrap_or(l.slow_kbps)
+        l.live_fast().max().unwrap_or(l.slow_kbps)
+    }
+
+    /// Like `link_kbps` but the lowest fast sample: what a burst may be sized from, so
+    /// one high outlier can't stretch it.
+    pub fn link_floor_kbps(&self) -> u32 {
+        let l = self.link.lock();
+        l.live_fast().min().unwrap_or(l.slow_kbps)
     }
 
     /// Forgets the delivery rate: the viewer counts as a slow link until measured again.
@@ -262,6 +291,8 @@ impl Client {
         l.clear_pool();
         l.fast.clear();
         l.slow_kbps = 0;
+        l.last_arrival = None;
+        l.last_arrival_v = None;
     }
 
     /// Stops video to a client that stopped acking, so it neither gates the healthy

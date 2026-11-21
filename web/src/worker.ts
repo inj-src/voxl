@@ -245,7 +245,7 @@ function flush() {
 					g.frame.close();
 				}
 		}
-		send(cmd.ack(id, performance.now() - f.tLast));
+		send(cmd.ack(id, performance.now() - f.tLast, f.tLast));
 		st.frames++;
 		st.decodeMs += performance.now() - f.t0;
 	}

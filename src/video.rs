@@ -8,7 +8,7 @@ use crate::hub::{Hub, Inflight, Out, SLOW_LINK_KBPS};
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -47,6 +47,9 @@ struct Job {
     paintover_first: bool,
     /// Last pass of a paint-over burst.
     paintover_final: bool,
+    /// On the last pass of a fast burst: the encoder fills in the rows of the stripes
+    /// that fell clearly short of the paint-over CRF, so capture can pass over them again.
+    sharp_check: Option<Arc<OnceLock<Vec<Band>>>>,
     /// Rows that changed in this capture.
     band: Option<Band>,
     /// Per-macroblock change map for this capture (None: analyse everything).
@@ -67,11 +70,19 @@ struct RateSnapshot {
     target_kbps: u32,
     congested: bool,
     slow_link: bool,
-    /// The slowest active viewer's last delivery sample (0: unmeasured).
+    /// The slowest active viewer's lowest fast delivery sample, else its last sample
+    /// (0: unmeasured).
     capacity_kbps: u32,
     /// `--fast-paintover-delay-ms` is set: `slow_link` comes from delivery samples.
     measured: bool,
 }
+
+/// A fast paint-over pass whose effective CRF ends up more than this above the
+/// paint-over CRF left its stripe soft; another pass follows, at most `PO_EXTRA_PASSES`
+/// of them within `PO_EXTRA_FOR` of the burst's first pass.
+const PO_SHORT_CRF: f32 = 2.0;
+const PO_EXTRA_PASSES: u32 = 8;
+const PO_EXTRA_FOR: Duration = Duration::from_millis(300);
 
 /// The rate a keyframe for a viewer not yet measured fast is sized from, whatever
 /// `--start-kbps` is, so its first picture crosses a slow link well within the stall limit.
@@ -374,7 +385,10 @@ struct RateCtl {
     /// is unmeasured or measured under it, or `--max-kbps` is under it; it leaves only
     /// on a fast delivery sample from every viewer.
     slow_link: bool,
-    /// The slowest active viewer's last delivery sample (kbit/s, 0: unmeasured).
+    /// The slowest active viewer's lowest fast delivery sample, else its last sample
+    /// (kbit/s, 0: unmeasured). Under `SLOW_LINK_KBPS` exactly when that viewer has no
+    /// fast evidence, so it decides `slow_link` as its best sample would, while a burst
+    /// sized from it can't be stretched by one high outlier.
     capacity_kbps: u32,
     /// `--fast-paintover-delay-ms` is set.
     measured: bool,
@@ -419,7 +433,7 @@ impl RateCtl {
         self.capacity_kbps = clients
             .iter()
             .filter(|c| !(healthy && c.stalled.load(Ordering::SeqCst)))
-            .map(|c| c.link_kbps())
+            .map(|c| c.link_floor_kbps())
             .min()
             .unwrap_or(0);
         let slow = SLOW_LINK_KBPS as f64;
@@ -615,6 +629,13 @@ impl Refiner {
     fn clear_all(&mut self) {
         self.pending.fill(false);
     }
+    /// Keeps pending only the blocks within `rows`.
+    fn keep_rows(&mut self, rows: &[Band]) {
+        for (i, p) in self.pending.iter_mut().enumerate() {
+            let y = (i / self.cols * 16) as u32;
+            *p &= rows.iter().any(|b| b.y0 <= y && y < b.y1);
+        }
+    }
     /// Every block not yet sharpened (1 = encode) and the row band they span.
     fn pending_map(&self) -> Option<(Vec<u8>, Band)> {
         let (mut r0, mut r1) = (usize::MAX, 0);
@@ -714,6 +735,11 @@ fn capture_loop(
     hub.slow_link_measured.store(rc.measured, Ordering::Relaxed);
     hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
     let mut last_paintover = false;
+    // A fast burst's last pass awaiting the encoder's verdict, the extra passes left,
+    // and when the burst's first pass went out.
+    let mut sharp_check: Option<Arc<OnceLock<Vec<Band>>>> = None;
+    let mut extra_left = PO_EXTRA_PASSES;
+    let mut burst_at = Instant::now();
     let mut had_clients = false;
     let mut full_next = true;
     let mut refiner = Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16));
@@ -797,6 +823,25 @@ fn capture_loop(
         // never run while congested.
         let fast_delay = cfg.fast_paintover_delay_ms.filter(|_| !rc.slow_link);
         let paintover_delay_ms = fast_delay.unwrap_or(cfg.paintover_delay_ms);
+        // The burst ended: pass again over what the encoder left soft, while the link
+        // stays fast and the extra passes last; else it is done.
+        let verdict = sharp_check.as_ref().and_then(|c| c.get().cloned());
+        if verdict.is_some() || (sharp_check.is_some() && burst_at.elapsed() > PO_EXTRA_FOR) {
+            let short = verdict.unwrap_or_default();
+            if !short.is_empty()
+                && extra_left > 0
+                && burst_at.elapsed() < PO_EXTRA_FOR
+                && fast_delay.is_some()
+                && !rc.congested
+            {
+                refiner.keep_rows(&short);
+                paintover_left = 1;
+                extra_left -= 1;
+            } else {
+                refiner.clear_all();
+            }
+            sharp_check = None;
+        }
         let paintover_due = paintover_left > 0
             && !rc.congested
             && last_motion.elapsed() >= Duration::from_millis(paintover_delay_ms);
@@ -927,6 +972,7 @@ fn capture_loop(
         let paintover = if is_motion {
             last_motion = Instant::now();
             paintover_left = cfg.paintover_burst;
+            sharp_check = None;
             // Piggyback sharpening of blocks that have gone still on this frame, unless
             // the link is currently congested.
             refine = if want_key || rc.congested || cfg.paintover_burst == 0 {
@@ -958,8 +1004,18 @@ fn capture_loop(
             last_motion = Instant::now();
         }
         let frame_paintover = paintover && refine.is_none();
+        if frame_paintover && paintover_first {
+            burst_at = Instant::now();
+            extra_left = PO_EXTRA_PASSES;
+        }
+        // A fast burst keeps what is pending until the encoder says it came out sharp.
+        let check = (frame_paintover && paintover_left == 0 && fast_delay.is_some())
+            .then(|| Arc::new(OnceLock::new()));
         if frame_paintover && paintover_left == 0 {
-            refiner.clear_all();
+            match &check {
+                Some(c) => sharp_check = Some(c.clone()),
+                None => refiner.clear_all(),
+            }
         }
         // A refinement frame encodes what moved plus what is due; everything else stays skipped.
         let mb_map = if want_key {
@@ -997,6 +1053,7 @@ fn capture_loop(
                 paintover,
                 paintover_first: frame_paintover && paintover_first,
                 paintover_final: frame_paintover && paintover_left == 0,
+                sharp_check: check,
                 mb_dirty: mb_map,
                 band,
                 captured_at: origin,
@@ -1065,7 +1122,8 @@ struct StripeJob {
     mb_cols: usize,
 }
 
-type StripeResult = (usize, Option<(bool, Vec<u8>)>);
+/// A stripe's output: keyframe, bytes, x264's effective CRF.
+type StripeResult = (usize, Option<(bool, Vec<u8>, f32)>);
 
 /// x264's sliced threading costs ~3x the CPU of one thread on desktop content (and on
 /// small updates is even slower), so a stripe encodes single-threaded and only fans out
@@ -1373,7 +1431,7 @@ fn stripe_worker(
                     crf: job.crf,
                 });
                 motion.note(&e, crf, size);
-                (out.len() > HDR).then_some((e.keyframe, out))
+                (out.len() > HDR).then_some((e.keyframe, out, e.crf_avg))
             }
             Err(e) => {
                 log::error!("{e}");
@@ -1432,6 +1490,10 @@ fn encode_loop(
             })
             .collect();
         if !selected.iter().any(|&x| x) {
+            if let Some(c) = &job.sharp_check {
+                let _ = c.set(Vec::new());
+                hub.wake();
+            }
             let _ = ret.send((job.idx, job.buf));
             continue;
         }
@@ -1531,11 +1593,24 @@ fn encode_loop(
                 pending += 1;
             }
         }
-        let mut results: Vec<Option<(bool, Vec<u8>)>> = (0..n).map(|_| None).collect();
+        let mut results: Vec<Option<(bool, Vec<u8>, f32)>> = (0..n).map(|_| None).collect();
         for _ in 0..pending {
             if let Ok((i, r)) = done_rx.recv() {
                 results[i] = r;
             }
+        }
+        if let Some(c) = &job.sharp_check {
+            let short = results
+                .iter()
+                .zip(&stripes)
+                .filter(|(r, _)| r.as_ref().is_some_and(|r| r.2 > want_crf + PO_SHORT_CRF))
+                .map(|(_, &(y, h, _))| Band {
+                    y0: y as u32,
+                    y1: (y + h) as u32,
+                })
+                .collect();
+            let _ = c.set(short);
+            hub.wake();
         }
         let _ = ret.send((job.idx, job.buf));
         for (y, h, touched) in stripes.iter_mut() {
@@ -1552,7 +1627,7 @@ fn encode_loop(
         let parts: Vec<(usize, bool, Vec<u8>)> = results
             .into_iter()
             .enumerate()
-            .filter_map(|(i, r)| r.map(|(k, o)| (i, k, o)))
+            .filter_map(|(i, r)| r.map(|(k, o, _)| (i, k, o)))
             .collect();
         if parts.is_empty() {
             continue;
@@ -1601,7 +1676,13 @@ fn encode_loop(
                 continue;
             }
             if !c.started.load(Ordering::SeqCst) {
-                if !all_key || key_for.as_ref().is_some_and(|ids| !ids.contains(&c.id)) {
+                // With measured links only a forced keyframe starts a viewer, the one sized
+                // for it: not an IDR from an encoder that reopened with new threads.
+                let for_it = match &key_for {
+                    Some(ids) => ids.contains(&c.id),
+                    None => !measured,
+                };
+                if !all_key || !for_it {
                     continue;
                 }
                 if c.stalled.load(Ordering::SeqCst) {
