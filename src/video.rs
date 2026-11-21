@@ -5,7 +5,7 @@ use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Hints, Planes};
 use crate::hub::wait_any;
 use crate::hub::{Hub, Inflight, Out, SLOW_LINK_KBPS};
-use crate::sweep::{PassJob, Sweep};
+use crate::sweep::{Next, Outcome, PassJob, Sweep};
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -434,10 +434,14 @@ impl RateCtl {
     /// counts at once rather than on the next rate tick.
     fn refresh_link(&mut self, clients: &[Arc<crate::hub::Client>]) {
         let healthy = clients.iter().any(|c| !c.stalled.load(Ordering::SeqCst));
-        // A viewer that joined is unmeasured (0) until its keyframe is acked.
+        // A viewer that joined is unmeasured (0) until its keyframe is acked. A stalled
+        // one counts once it is sent frames again: its restart keyframe goes out before
+        // it acks it, and what follows queues behind that.
         self.capacity_kbps = clients
             .iter()
-            .filter(|c| !(healthy && c.stalled.load(Ordering::SeqCst)))
+            .filter(|c| {
+                !(healthy && c.stalled.load(Ordering::SeqCst) && !c.started.load(Ordering::SeqCst))
+            })
             .map(|c| c.link_floor_kbps())
             .min()
             .unwrap_or(0);
@@ -821,8 +825,17 @@ fn capture_loop(
         // On a link measured fast, with AQ, a paint-over is a sweep. A keyframe, a viewer
         // that isn't measured fast and congestion end it (motion does, below).
         let sweeping = fast_delay.is_some() && !rc.congested && !want_key && sweep_layout.is_some();
-        if !sweeping {
+        // A pass's blocks stop being pending once it is coded, before this capture's
+        // changes are marked.
+        let mut next = sweep.as_mut().map(|s| s.wait(&mut refiner.pending));
+        if let Some(Next::Restart) = next {
+            refiner.mark_all();
+            paintover_left = cfg.paintover_burst.max(1);
             sweep = None;
+        }
+        if !sweeping || sweep.is_none() {
+            sweep = None;
+            next = None;
         }
         let mut paintover_due = paintover_left > 0
             && !rc.congested
@@ -830,14 +843,13 @@ fn capture_loop(
         // A sweep's next pass waits for the last one's size (the encoder wakes us), then
         // for the link to carry it.
         let mut sweep_wait = None;
-        if let (true, Some(s)) = (paintover_due, sweep.as_mut()) {
-            match s.wait() {
-                Some(d) if d.is_zero() => {}
-                d => {
-                    paintover_due = false;
-                    sweep_wait = Some(d.map_or(100, |d| d.as_millis() as i32 + 1));
-                }
+        if paintover_due {
+            match next {
+                Some(Next::Report) => sweep_wait = Some(100),
+                Some(Next::After(d)) if !d.is_zero() => sweep_wait = Some(d.as_millis() as i32 + 1),
+                _ => {}
             }
+            paintover_due = sweep_wait.is_none();
         }
         if !cap.damaged && !want_key && !paintover_due {
             let wait = paintover_delay_ms.saturating_sub(last_motion.elapsed().as_millis() as u64);
@@ -936,7 +948,7 @@ fn capture_loop(
             let next = match (sweeping, &sweep_layout) {
                 (true, Some(layout)) => sweep
                     .get_or_insert_with(|| Sweep::new(layout, refiner.cols, sweep_qps))
-                    .plan(&mut refiner.pending, rc.capacity_kbps, eff_min_interval)
+                    .plan(&refiner.pending, rc.capacity_kbps, eff_min_interval)
                     .map(|p| {
                         sweep_pass = Some((p.job, p.last));
                         (p.map, p.band)
@@ -991,20 +1003,13 @@ fn capture_loop(
             };
             refine.is_some()
         } else if paintover_due {
-            match &sweep_pass {
-                // A sweep runs until nothing is pending.
-                Some((_, last)) => {
-                    if *last {
-                        paintover_left = 0;
-                        sweep = None;
-                    }
-                }
-                None => {
-                    paintover_first = fast_delay.is_some()
-                        && paintover_left == cfg.paintover_burst.max(1)
-                        && !want_key;
-                    paintover_left -= 1;
-                }
+            // A sweep runs until nothing is pending, which its next pass finds out once
+            // this one is coded.
+            if sweep_pass.is_none() {
+                paintover_first = fast_delay.is_some()
+                    && paintover_left == cfg.paintover_burst.max(1)
+                    && !want_key;
+                paintover_left -= 1;
             }
             hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
             true
@@ -1064,7 +1069,8 @@ fn capture_loop(
                 force_idr: want_key,
                 paintover,
                 paintover_first: frame_paintover && paintover_first,
-                paintover_final: frame_paintover && paintover_left == 0,
+                paintover_final: frame_paintover
+                    && (paintover_left == 0 || sweep_pass.as_ref().is_some_and(|p| p.1)),
                 sweep: sweep_pass.map(|(j, _)| j),
                 mb_dirty: mb_map,
                 band,
@@ -1345,7 +1351,8 @@ fn stripe_worker(
         } else {
             job.crf
         };
-        let sweep_qp = job.sweep_qp.filter(|_| !std::mem::take(&mut fresh));
+        let was_fresh = std::mem::take(&mut fresh);
+        let sweep_qp = job.sweep_qp.filter(|_| !was_fresh);
         if sweep_qp.is_some() {
             // The VBV cap stays the last motion frame's, and takes the pass's bytes.
             s.enc.begin_forced_qp();
@@ -1423,7 +1430,8 @@ fn stripe_worker(
                 out.len()
             );
         }
-        if s.max_threads > 1 {
+        // Not between a sweep's passes: the reopened encoder's IDR would end the sweep.
+        if s.max_threads > 1 && job.sweep_qp.is_none() {
             if let Some(t) = gov.want(
                 te.elapsed().as_secs_f64() * 1000.0,
                 changed as f64,
@@ -1489,7 +1497,9 @@ fn encode_loop(
     motion_quality: bool,
 ) {
     let epoch = Instant::now();
-    let mut frame_id: u32 = 0;
+    // Ids go on across display rebuilds, so an ack for a frame of the last pipeline
+    // can't be read as one for this one's.
+    let mut frame_id = hub.frame_id.load(Ordering::Relaxed);
     let n = stripes_in.len();
     let fps = stripes_in.first().map_or(30, |s| s.cfg.fps.max(1));
     let debug_stripes = std::env::var("VOXL_DEBUG_STRIPES").is_ok();
@@ -1528,7 +1538,11 @@ fn encode_loop(
         };
         if !selected.iter().any(|&x| x) {
             if let Some(p) = &job.sweep {
-                let _ = p.report.set(vec![(0, 0); n]);
+                let _ = p.report.set(Outcome {
+                    bytes: vec![None; n],
+                    keyframe: false,
+                    sent: Instant::now(),
+                });
                 hub.wake();
             }
             let _ = ret.send((job.idx, job.buf));
@@ -1637,15 +1651,18 @@ fn encode_loop(
                 results[i] = r;
             }
         }
-        if let Some(p) = &job.sweep {
-            let sizes = results
-                .iter()
-                .zip(&p.per_stripe)
-                .map(|(r, &b)| (b, r.as_ref().map_or(0, |r| r.1.len() - HDR)))
-                .collect();
-            let _ = p.report.set(sizes);
-            hub.wake();
-        }
+        // A sweep pass's report goes in once the pass is queued for sending.
+        let mut report = job.sweep.as_ref().map(|p| {
+            let outcome = Outcome {
+                bytes: results
+                    .iter()
+                    .map(|r| r.as_ref().map(|r| r.1.len() - HDR))
+                    .collect(),
+                keyframe: results.iter().flatten().any(|r| r.0),
+                sent: Instant::now(),
+            };
+            (p.report.clone(), outcome)
+        });
         let _ = ret.send((job.idx, job.buf));
         for (y, h, touched) in stripes.iter_mut() {
             if job.paintover_final {
@@ -1664,6 +1681,10 @@ fn encode_loop(
             .filter_map(|(i, r)| r.map(|(k, o)| (i, k, o)))
             .collect();
         if parts.is_empty() {
+            if let Some((r, o)) = report.take() {
+                let _ = r.set(o);
+                hub.wake();
+            }
             continue;
         }
         let enc_us = t0.elapsed().as_micros() as u64;
@@ -1676,6 +1697,7 @@ fn encode_loop(
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
         }
         frame_id = frame_id.wrapping_add(1);
+        hub.frame_id.store(frame_id, Ordering::Relaxed);
         // Server-side pipeline latency (capture -> sent) in 1/10 ms, for client stats.
         let mut pipe = (job.captured_at.elapsed().as_micros() / 100).min(u32::MAX as u128) as u32;
         if job.marker_ms >= 0 {
@@ -1741,6 +1763,11 @@ fn encode_loop(
             for m in &msgs {
                 c.send(Out::Bin(m.clone()));
             }
+        }
+        if let Some((r, mut o)) = report.take() {
+            o.sent = now;
+            let _ = r.set(o);
+            hub.wake();
         }
         hub.stats.send_lat_us.fetch_add(
             job.captured_at.elapsed().as_micros() as u64,

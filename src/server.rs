@@ -394,10 +394,11 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
         ))),
         "v" => {
             let on = rest == "1";
-            c.video.store(on, Ordering::Relaxed);
+            // Reset before frames go to it again, so none goes out on the old state.
             if on {
                 c.restart_video();
             }
+            c.video.store(on, Ordering::Relaxed);
             s.hub.wake();
         }
         "au" => c.audio.store(rest == "1" && s.audio, Ordering::Relaxed),

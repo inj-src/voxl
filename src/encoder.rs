@@ -38,6 +38,9 @@ pub struct Encoder {
     pub height: u32,
     /// Forced-QP frames are being encoded (`begin_forced_qp`).
     forced_qp: bool,
+    /// `end_forced_qp` ran and no frame has been encoded since. x264 applies only the
+    /// last reconfig before a frame, so until then every reconfig turns the CRF max off.
+    clear_rf_max: bool,
 }
 
 unsafe impl Send for Encoder {}
@@ -163,6 +166,7 @@ impl Encoder {
                 width: cfg.width,
                 height: cfg.height,
                 forced_qp: false,
+                clear_rf_max: false,
             })
         }
     }
@@ -184,6 +188,7 @@ impl Encoder {
             return;
         }
         self.forced_qp = true;
+        self.clear_rf_max = false;
         unsafe {
             self.param.rc.f_rf_constant = 0.01;
             self.param.rc.f_rf_constant_max = 0.02;
@@ -192,17 +197,30 @@ impl Encoder {
     }
 
     /// Back to CRF after forced-QP frames, at `crf`. A CRF max equal to the CRF turns
-    /// the max off (0 would keep the last one); later reconfigs leave it off.
+    /// the max off (0 would keep the last one). x264 builds each reconfig from the
+    /// parameters it last applied, and applies only the last one before a frame, so
+    /// `set_rate_buf` repeats this until the next frame is encoded.
     pub fn end_forced_qp(&mut self, crf: f32) {
         if !self.forced_qp {
             return;
         }
         self.forced_qp = false;
+        self.clear_rf_max = true;
         unsafe {
-            self.param.rc.f_rf_constant = crf;
-            self.param.rc.f_rf_constant_max = crf;
+            self.set_crf_clearing_max(crf);
             ffi::x264_encoder_reconfig(self.h, &mut self.param);
-            self.param.rc.f_rf_constant_max = 0.0;
+        }
+    }
+
+    /// The CRF, with a max equal to it while `clear_rf_max`: x264 takes a max of 0 as
+    /// "keep the last one", so a CRF of 0 is raised to 0.01 for it.
+    fn set_crf_clearing_max(&mut self, crf: f32) {
+        if self.clear_rf_max {
+            let c = crf.max(0.01);
+            self.param.rc.f_rf_constant = c;
+            self.param.rc.f_rf_constant_max = c;
+        } else {
+            self.param.rc.f_rf_constant = crf;
         }
     }
 
@@ -218,7 +236,7 @@ impl Encoder {
     /// Reconfigure rate control with an explicit VBV buffer (kbit).
     pub fn set_rate_buf(&mut self, crf: f32, max_kbps: u32, buf_kbit: u32) {
         unsafe {
-            self.param.rc.f_rf_constant = crf;
+            self.set_crf_clearing_max(crf);
             if max_kbps > 0 {
                 self.param.rc.i_vbv_max_bitrate = max_kbps as i32;
                 self.param.rc.i_vbv_buffer_size = buf_kbit.max(1) as i32;
@@ -264,6 +282,11 @@ impl Encoder {
             let mut pic_out: ffi::x264_picture_t = std::mem::zeroed();
             let size =
                 ffi::x264_encoder_encode(self.h, &mut nals, &mut n, &mut self.pic, &mut pic_out);
+            if self.clear_rf_max {
+                // The max is off now; later reconfigs leave it off.
+                self.clear_rf_max = false;
+                self.param.rc.f_rf_constant_max = 0.0;
+            }
             if size < 0 {
                 return Err("x264_encoder_encode failed".into());
             }

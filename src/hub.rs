@@ -84,9 +84,9 @@ pub struct LinkEst {
     /// The viewer reports arrival times. Without them a frame that queued is timed from
     /// a server stamp that return-path delay can make late, so it never counts as fast.
     viewer_clock: bool,
-    /// The last frame timed: bytes and delivery ms. A frame that queued behind it is
-    /// timed together with it.
-    last_timed: Option<(usize, f64)>,
+    /// The run of frames that queued one behind the other, from the last that didn't:
+    /// bytes and delivery ms. A frame that queued is timed with the whole run.
+    burst: Option<(usize, f64)>,
     /// Frames too small to time alone, added up: bytes, delivery ms, first added.
     pool_bytes: usize,
     pool_ms: f64,
@@ -222,8 +222,8 @@ impl Client {
     /// is the ack time minus the viewer's hold (`viewer`: hold, arrival on its clock).
     /// Frames that queued behind the previous ones are timed from the previous arrival,
     /// on the viewer's clock, which a delayed or bunched ack can't shorten, together with
-    /// the frame they queued behind: one that finished late (a retransmit) releases the
-    /// next soon after, and that frame alone would read fast.
+    /// the whole run they queued in: one that finished late (a retransmit) releases the
+    /// rest soon after, and each of those alone would read fast.
     fn sample_link(&self, sent: [Instant; 2], bytes: usize, viewer: (f64, Option<f64>)) {
         let (hold_ms, arrived_v) = viewer;
         let arrived_v = arrived_v.filter(|v| v.is_finite());
@@ -241,8 +241,12 @@ impl Client {
         let gap_v = arrived_v.zip(prev_v).map(|(a, p)| a - p);
         let gap =
             gap_v.or(prev.map(|p| arrived.saturating_duration_since(p).as_secs_f64() * 1000.0));
-        if gap.is_some_and(|g| g < LINK_SAMPLE_MIN_MS) {
-            l.last_timed = None;
+        // Released together (a retransmit): too close to time, so it joins the run.
+        if let Some(g) = gap.filter(|&g| g < LINK_SAMPLE_MIN_MS) {
+            if let Some(b) = l.burst.as_mut() {
+                b.0 += bytes;
+                b.1 += g.max(0.0);
+            }
             return;
         }
         // The smaller of the ping RTT and the fastest ack, so a high ping can't inflate it.
@@ -265,20 +269,19 @@ impl Client {
             (Some(_), Some(g)) => g,
             (Some(p), None) => (arrived - p).as_secs_f64() * 1000.0,
             // Arrived within the RTT baseline: too small to time, and no bytes are credited.
-            (None, _) if arrived <= start => {
-                l.last_timed = None;
-                return;
-            }
+            (None, _) if arrived <= start => return,
             (None, _) => since_start,
         };
         let kbps = |b: usize, ms: f64| (b as f64 * 8.0 / ms.max(LINK_SAMPLE_MIN_MS)) as u32;
-        let ahead = l.last_timed.replace((bytes, ms));
+        // Frames released one after another each read fast alone: a frame that queued
+        // adds to the run it queued behind, and one that didn't starts a new run.
+        let run = match (queued, l.burst) {
+            (Some(_), Some((b, t))) => (b + bytes, t + ms),
+            _ => (bytes, ms),
+        };
+        l.burst = Some(run);
         if bytes >= LINK_SAMPLE_MIN_BYTES {
-            let (b, t) = match (queued, ahead) {
-                (Some(_), Some((b, t))) => (bytes + b, ms + t),
-                _ => (bytes, ms),
-            };
-            l.record(kbps(b, t), true, now);
+            l.record(kbps(run.0, run.1), true, now);
             return;
         }
         if l.pool_at
@@ -320,7 +323,7 @@ impl Client {
         l.slow_kbps = 0;
         l.last_arrival = None;
         l.last_arrival_v = None;
-        l.last_timed = None;
+        l.burst = None;
     }
 
     /// Stops video to a client that stopped acking, so it neither gates the healthy
@@ -514,6 +517,8 @@ pub struct Hub {
     /// samples (`--fast-paintover-delay-ms`), for `/stats`.
     pub slow_link: AtomicBool,
     pub slow_link_measured: AtomicBool,
+    /// The last video frame id sent, kept across display rebuilds.
+    pub frame_id: AtomicU32,
     /// Maximum outbound clipboard image size in bytes (0 disables outbound image push).
     pub max_clipboard_image_bytes: AtomicU64,
     /// Last cursor message (id, full PNG/RGBA message), replayed to new clients.
@@ -550,6 +555,7 @@ impl Hub {
             congested: AtomicBool::new(false),
             slow_link: AtomicBool::new(false),
             slow_link_measured: AtomicBool::new(false),
+            frame_id: AtomicU32::new(0),
             max_clipboard_image_bytes: AtomicU64::new(15 << 20),
             stripes: Mutex::new(Vec::new()),
             cursor: Mutex::new(None),
