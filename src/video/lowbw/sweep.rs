@@ -100,15 +100,12 @@ pub struct PassJob {
     pub report: Report,
 }
 
-/// x264 setup for one stripe's part of a pass: `mb_info` and `quant_offsets` for its
-/// macroblocks. `map` is the stripe's slice of `Pass::map`.
-pub fn stripe_hints(map: &[u8]) -> (Vec<u8>, Vec<f32>) {
-    let info = map.iter().map(|&a| (a == 0) as u8).collect();
-    let offsets = map
-        .iter()
-        .map(|&a| if a == 0 { SKIP_QP_OFFSET } else { 0.0 })
-        .collect();
-    (info, offsets)
+/// `quant_offsets` for one stripe's part of a pass, from its `mb_info` (built from the
+/// stripe's slice of `Pass::map`): the blocks outside the pass are X264_MBINFO_CONSTANT.
+pub fn quant_offsets(info: &[u8]) -> Vec<f32> {
+    info.iter()
+        .map(|&c| if c == 1 { SKIP_QP_OFFSET } else { 0.0 })
+        .collect()
 }
 
 struct StripeState {

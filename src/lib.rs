@@ -30,7 +30,6 @@ mod record;
 #[cfg(target_os = "linux")]
 mod screen;
 mod server;
-mod sweep;
 mod tls;
 mod video;
 mod wait;
@@ -166,14 +165,9 @@ async fn serve(a: HashMap<String, String>) {
         crf: range_max(a.get("crf"), 24.0) as f32,
         // Selkies' --video-bitrate becomes the ceiling for adaptive bitrate.
         max_kbps: range_max(a.get("max-kbps").or(a.get("video-bitrate")), 30000.0) as u32,
-        start_kbps: range_max(a.get("start-kbps"), 8000.0) as u32,
         paintover_crf: range_max(a.get("paintover-crf"), 16.0) as f32,
         paintover_burst: range_max(a.get("paintover-burst"), 3.0) as u32,
         paintover_delay_ms: range_max(a.get("paintover-delay-ms"), 150.0) as u64,
-        fast_paintover_delay_ms: a
-            .get("fast-paintover-delay-ms")
-            .map(|v| range_max(Some(v), 0.0) as u64)
-            .filter(|&ms| ms > 0),
         min_kbps: range_max(a.get("min-kbps"), 2000.0) as u32,
         stripes: range_max(a.get("stripes"), 1.0) as u32,
         // Opt-in: one thread unless a frame would miss the frame budget. x264's sliced
@@ -181,10 +175,7 @@ async fn serve(a: HashMap<String, String>) {
         // small updates encode a few ms slower on one thread.
         adaptive_threads: truthy(a.get("adaptive-threads"), false),
         coalesce: std::time::Duration::from_micros(range_max(a.get("coalesce-us"), 0.0) as u64),
-        ref_frames: a.get("ref-frames").map(|v| range_max(Some(v), 1.0) as u32),
-        me_range: range_max(a.get("me-range"), 64.0) as u32,
-        motion_quality: truthy(a.get("motion-quality"), true),
-        adaptive_fps: truthy(a.get("adaptive-fps"), false),
+        lb: lowbw::Config::parse(&a),
     };
     let clip = a
         .get("enable-clipboard")

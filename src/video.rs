@@ -2,16 +2,16 @@
 
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
-use crate::encoder::{Encoded, Encoder, EncoderConfig, Hints, Planes};
+use crate::encoder::{Encoded, Encoder, EncoderConfig, Planes};
 use crate::hub::wait_any;
 use crate::hub::{Hub, Inflight, Out};
-use crate::lowbw::SLOW_LINK_KBPS;
-use crate::sweep::{Next, Outcome, PassJob, Sweep};
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod lowbw;
 
 #[derive(Clone)]
 pub struct VideoConfig {
@@ -24,20 +24,14 @@ pub struct VideoConfig {
     pub convert_threads: usize,
     pub crf: f32,
     pub max_kbps: u32,
-    pub start_kbps: u32,
     pub paintover_crf: f32,
     pub paintover_burst: u32,
     pub paintover_delay_ms: u64,
-    /// Paint-over delay once acks show the link has headroom (None: off).
-    pub fast_paintover_delay_ms: Option<u64>,
     pub min_kbps: u32,
     pub coalesce: Duration,
     pub stripes: u32,
     pub adaptive_threads: bool,
-    pub ref_frames: Option<u32>,
-    pub me_range: u32,
-    pub motion_quality: bool,
-    pub adaptive_fps: bool,
+    pub lb: crate::lowbw::Config,
 }
 
 struct Job {
@@ -45,42 +39,16 @@ struct Job {
     idx: usize,
     force_idr: bool,
     paintover: bool,
-    /// First pass of a fast paint-over burst (`--fast-paintover-delay-ms`).
-    paintover_first: bool,
-    /// Last pass of a paint-over burst or sweep.
+    /// Last pass of a paint-over burst.
     paintover_final: bool,
-    /// A sweep pass (`mb_dirty` holds its blocks).
-    sweep: Option<PassJob>,
     /// Rows that changed in this capture.
     band: Option<Band>,
     /// Per-macroblock change map for this capture (None: analyse everything).
     mb_dirty: Option<Arc<Vec<u8>>>,
     captured_at: Instant,
     marker_ms: i64,
-    /// `--framerate` over the capture rate adaptive FPS settled on. x264 budgets each
-    /// frame as 1/`--framerate` of the cap, so the cap is scaled up by this to keep the
-    /// bitrate at the target when fewer frames are captured.
-    rate_scale: f64,
-    /// The rate controller's state at capture, read as one with `rate_scale`.
-    rate: RateSnapshot,
+    lb: lowbw::JobState,
 }
-
-/// What the encoder needs from the rate controller, taken at one instant.
-#[derive(Clone, Copy)]
-struct RateSnapshot {
-    target_kbps: u32,
-    congested: bool,
-    slow_link: bool,
-    /// The slowest active viewer's lowest fast delivery sample, else its last sample
-    /// (0: unmeasured).
-    capacity_kbps: u32,
-    /// `--fast-paintover-delay-ms` is set: `slow_link` comes from delivery samples.
-    measured: bool,
-}
-
-/// The rate a keyframe for a viewer not yet measured fast is sized from, whatever
-/// `--start-kbps` is, so its first picture crosses a slow link well within the stall limit.
-const UNMEASURED_KEY_KBPS: u32 = 1500;
 
 fn union(a: Option<Band>, b: Band) -> Band {
     match a {
@@ -98,8 +66,6 @@ struct Pipeline {
     job_tx: mpsc::SyncSender<Job>,
     ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
     encode: std::thread::JoinHandle<()>,
-    /// The stripe layout when every stripe's encoder has AQ on, which the sweep needs.
-    sweep_layout: Option<Vec<(u32, u32)>>,
 }
 
 /// Runs the pipeline. With a `Screen` (dynamic resolution), a client's size request
@@ -113,11 +79,7 @@ pub fn spawn(
     if let Some(s) = &screen {
         *hub.resize_max.lock() = Some(s.max());
     }
-    // Before any viewer joins: it decides whether viewers keep delivery samples.
-    hub.lb
-        .slow_link_measured
-        .store(cfg.fast_paintover_delay_ms.is_some(), Ordering::Relaxed);
-    crate::encoder::set_tuning(cfg.ref_frames, cfg.me_range);
+    lowbw::spawn(&cfg, &hub);
     let mut p = build(&cfg, &hub)?;
     std::thread::Builder::new()
         .name("capture".into())
@@ -127,10 +89,8 @@ pub fn spawn(
                 job_tx,
                 ret_rx,
                 encode,
-                sweep_layout,
             } = p;
-            let chans = (job_tx, ret_rx);
-            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), chans, sweep_layout) {
+            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), job_tx, ret_rx) {
                 #[cfg(target_os = "linux")]
                 let resized = cap.geometry_changed();
                 #[cfg(not(target_os = "linux"))]
@@ -264,28 +224,13 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
             applied_crf: -1.0,
         });
     }
-    let sweep_layout = stripes
-        .iter()
-        .all(|s| s.enc.aq_enabled())
-        .then(|| layout.clone());
+    lowbw::note_layout(hub, &stripes, &layout);
     *hub.stripes.lock() = layout;
     let hub2 = hub.clone();
-    let (crf, po_crf, min_kbps, motion_quality) =
-        (cfg.crf, cfg.paintover_crf, cfg.min_kbps, cfg.motion_quality);
+    let (crf, po_crf) = (cfg.crf, cfg.paintover_crf);
     let encode = std::thread::Builder::new()
         .name("encode".into())
-        .spawn(move || {
-            encode_loop(
-                stripes,
-                job_rx,
-                ret_tx,
-                hub2,
-                crf,
-                po_crf,
-                min_kbps,
-                motion_quality,
-            )
-        })
+        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf))
         .unwrap();
     #[cfg(target_os = "macos")]
     {
@@ -308,37 +253,14 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
         job_tx,
         ret_rx,
         encode,
-        sweep_layout,
     })
 }
 
 fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
-    let target_kbps = hub.target_kbps.load(Ordering::Relaxed);
-    // On slow uplinks (<1 Mbps), a legitimate keyframe or dense delta can take >4 s
-    // to cross the link; resyncing at 4 s causes an infinite keyframe loop.
-    let stall_ms: u128 = if target_kbps > 0 && target_kbps < 1000 {
-        12_000
-    } else {
-        4_000
-    };
-    let clients = hub.video_clients();
-    // Stalled viewers are ignored while a healthy one is watching; a lone stalled viewer
-    // still gets flow control, or nothing would pace its stream.
-    let healthy = clients.iter().any(|c| !c.lb.stalled.load(Ordering::SeqCst));
+    let (stall, clients) = lowbw::Stall::new(hub);
     for c in clients {
         let (n, age) = c.backlog();
         if n == 0 {
-            continue;
-        }
-        if c.lb.draining.load(Ordering::SeqCst) {
-            if age > stall_ms * 2 {
-                // It never acked what it was sent (a lost ack or a decoder reset): give up
-                // waiting and restart it with a keyframe.
-                log::warn!("client {} did not catch up in {} ms; restarting", c.id, age);
-                c.inflight.lock().clear();
-                c.lb.draining.store(false, Ordering::SeqCst);
-                c.needs_keyframe.store(true, Ordering::Relaxed);
-            }
             continue;
         }
         let rtt = match c.min_rtt_ms.load(Ordering::Relaxed) {
@@ -348,20 +270,7 @@ fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
         // Enough frames in flight to cover one RTT plus decode, but never more than ~rtt+120ms of queue.
         let max_n = (((rtt + 40.0) / interval_ms).ceil() as usize + 2).clamp(3, 40);
         let max_age = rtt as u128 + 120;
-        if age > stall_ms {
-            // Stalled client (hidden tab, dead socket): stop letting it gate everyone,
-            // and stop sending to it until it has read what it was already sent.
-            log::warn!(
-                "client {} stalled ({} frames, {} ms); pausing its video",
-                c.id,
-                n,
-                age
-            );
-            c.mark_stalled();
-            continue;
-        }
-        if healthy && c.lb.stalled.load(Ordering::SeqCst) {
-            // Restarted but has not acked its keyframe yet: it must not gate the others.
+        if stall.skip(&c, n, age) {
             continue;
         }
         if n >= max_n || age > max_age {
@@ -386,26 +295,17 @@ struct RateCtl {
     /// Delivery rate observed at the last congestion: the path's likely capacity.
     ceiling: f64,
     ceiling_at: Instant,
-    congested: bool,
-    /// The target is under `SLOW_LINK_KBPS`. When `measured`: instead, some active viewer
-    /// is unmeasured or measured under it, or `--max-kbps` is under it; it leaves only
-    /// on a fast delivery sample from every viewer.
-    slow_link: bool,
-    /// The slowest active viewer's lowest fast delivery sample, else its last sample
-    /// (kbit/s, 0: unmeasured). Under `SLOW_LINK_KBPS` exactly when that viewer has no
-    /// fast evidence, so it decides `slow_link` as its best sample would, while a burst
-    /// sized from it can't be stretched by one high outlier.
-    capacity_kbps: u32,
-    /// `--fast-paintover-delay-ms` is set.
-    measured: bool,
+    lb: lowbw::RateState,
 }
 
+/// Starting point for a new session's bitrate cap (kbit/s).
+const START_KBPS: f64 = 8000.0;
+
 impl RateCtl {
-    fn new(max: f64, min: f64, start: f64) -> Self {
-        let min = min.min(max);
+    fn new(max: f64, min: f64) -> Self {
         let past = Instant::now() - Duration::from_secs(10);
         RateCtl {
-            target: start.clamp(min, max),
+            target: START_KBPS.min(max),
             max,
             min,
             last_eval: past,
@@ -414,62 +314,8 @@ impl RateCtl {
             slow_start: true,
             ceiling: f64::MAX,
             ceiling_at: past,
-            congested: false,
-            slow_link: true,
-            capacity_kbps: 0,
-            measured: false,
+            lb: Default::default(),
         }
-    }
-
-    fn snapshot(&self) -> RateSnapshot {
-        RateSnapshot {
-            target_kbps: self.target as u32,
-            congested: self.congested,
-            slow_link: self.slow_link,
-            capacity_kbps: self.capacity_kbps,
-            measured: self.measured,
-        }
-    }
-
-    /// Recomputes `slow_link` from the viewers now watching, so a join, leave or restart
-    /// counts at once rather than on the next rate tick.
-    fn refresh_link(&mut self, clients: &[Arc<crate::hub::Client>]) {
-        let healthy = clients.iter().any(|c| !c.lb.stalled.load(Ordering::SeqCst));
-        // A viewer that joined is unmeasured (0) until its keyframe is acked. A stalled
-        // one counts once it is sent frames again: its restart keyframe goes out before
-        // it acks it, and what follows queues behind that.
-        self.capacity_kbps = clients
-            .iter()
-            .filter(|c| {
-                !(healthy
-                    && c.lb.stalled.load(Ordering::SeqCst)
-                    && !c.started.load(Ordering::SeqCst))
-            })
-            .map(|c| c.link_floor_kbps())
-            .min()
-            .unwrap_or(0);
-        let slow = SLOW_LINK_KBPS as f64;
-        self.slow_link = if self.measured {
-            self.max < slow || self.capacity_kbps < SLOW_LINK_KBPS
-        } else {
-            self.target < slow
-        };
-    }
-
-    /// Capture FPS ceiling adjusted for current bandwidth target and congestion.
-    fn effective_fps(&self, base_fps: u32) -> u32 {
-        let mut fps = base_fps.max(1);
-        if self.target < 350.0 {
-            fps = fps.min(8);
-        } else if self.target < 600.0 {
-            fps = fps.min(12);
-        } else if self.target < 1000.0 {
-            fps = fps.min(15);
-        }
-        if self.congested {
-            fps = (fps / 2).max(6).min(base_fps.max(1));
-        }
-        fps
     }
 
     fn update(&mut self, hub: &Hub, clients: &[Arc<crate::hub::Client>]) {
@@ -479,11 +325,10 @@ impl RateCtl {
         }
         self.last_eval = Instant::now();
         let mut congested = false;
-        let mut hit = Vec::new();
         let mut clear = true;
         let mut rate = f64::MAX;
         let mut delivered = 0f64;
-        let healthy = clients.iter().any(|c| !c.lb.stalled.load(Ordering::SeqCst));
+        let healthy = lowbw::healthy(clients);
         for c in clients {
             // A stalled viewer's delay is its own problem, not the path's, unless it is the
             // only one watching.
@@ -493,23 +338,16 @@ impl RateCtl {
                 continue;
             }
             let (n, age) = c.backlog();
-            let q = {
-                let mut e = c.delay.lock();
-                // Queueing delay is only measured on acks. Once everything sent has been
-                // acked nothing of ours is queued, so the last burst's delay is stale:
-                // keeping it would hold an idle session congested forever.
-                if n == 0 {
-                    e.queue_ms = 0.0;
-                }
-                e.queue_ms
-            };
+            let q = lowbw::queue_ms(c, n);
             let rtt = match c.min_rtt_ms.load(Ordering::Relaxed) {
                 0 => 40,
                 r => r,
             } as f64;
             if q > 30.0 || age as f64 > rtt + 80.0 {
                 congested = true;
-                hit.push(c);
+                // Congestion revokes a viewer's fast verdict; only a fresh fast delivery
+                // sample (`Client::link_kbps`) restores it.
+                c.reset_link();
                 let r = c.delivered.lock().rate_bps / 1000.0;
                 if r > 0.0 {
                     rate = rate.min(r);
@@ -581,14 +419,7 @@ impl RateCtl {
                 self.last_inc = now;
             }
         }
-        // Congestion revokes a viewer's fast verdict; only a fresh fast delivery sample
-        // (`Client::link_kbps`) restores it.
-        for c in hit {
-            c.reset_link();
-        }
-        self.congested = congested;
-        self.refresh_link(clients);
-        hub.lb.congested.store(congested, Ordering::Relaxed);
+        self.lb_update(hub, clients, congested);
         hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
     }
 }
@@ -605,13 +436,8 @@ struct Refiner {
     cols: usize,
 }
 
-/// How long a block stays still before it is sharpened, and how often a refinement
-/// pass may run. Slow links wait twice as long so refinement doesn't compete with motion;
-/// with `--fast-paintover-delay-ms` a link with headroom waits half as long.
 const REFINE_STILL_MS: u32 = 300;
 const REFINE_EVERY: Duration = Duration::from_millis(250);
-const FAST_REFINE_STILL_MS: u32 = 150;
-const FAST_REFINE_EVERY: Duration = Duration::from_millis(120);
 
 impl Refiner {
     fn new(blocks: usize, cols: usize) -> Self {
@@ -669,14 +495,8 @@ impl Refiner {
         })
     }
     /// Blocks due for sharpening (1 = refine) and the row band they span.
-    fn due(&mut self, slow_link: bool, fast: bool) -> Option<(Vec<u8>, Band)> {
-        let (still_ms, every) = if slow_link {
-            (REFINE_STILL_MS * 2, REFINE_EVERY * 2)
-        } else if fast {
-            (FAST_REFINE_STILL_MS, FAST_REFINE_EVERY)
-        } else {
-            (REFINE_STILL_MS, REFINE_EVERY)
-        };
+    /// `still_ms`, `every`: REFINE_STILL_MS and REFINE_EVERY, or the fork's (`lowbw`).
+    fn due(&mut self, (still_ms, every): (u32, Duration)) -> Option<(Vec<u8>, Band)> {
         if self.last_refine.elapsed() < every {
             return None;
         }
@@ -719,8 +539,8 @@ fn capture_loop(
     cap: &mut Capturer,
     cfg: VideoConfig,
     hub: Arc<Hub>,
-    (job_tx, ret_rx): (mpsc::SyncSender<Job>, mpsc::Receiver<(usize, Box<I420>)>),
-    sweep_layout: Option<Vec<(u32, u32)>>,
+    job_tx: mpsc::SyncSender<Job>,
+    ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
 ) -> Result<(), String> {
     let (w, h) = (cap.width as usize, cap.height as usize);
     let mut pool: Vec<Option<Box<I420>>> = vec![
@@ -730,22 +550,15 @@ fn capture_loop(
     let mut pending: [Option<Band>; 2] = [Some(cap.full()), Some(cap.full())];
     let mut next_idx = 0usize;
     let interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
+    // Allow slight early capture so source jitter doesn't alias into dropped frames.
+    let min_interval = interval.mul_f64(0.85);
+    let interval_ms = interval.as_secs_f64() * 1000.0;
     let mut last_capture = Instant::now() - interval;
     let mut last_motion = Instant::now();
     let mut paintover_left = 0u32;
-    let mut rc = RateCtl::new(
-        cfg.max_kbps as f64,
-        cfg.min_kbps as f64,
-        cfg.start_kbps as f64,
-    );
-    rc.measured = cfg.fast_paintover_delay_ms.is_some();
-    hub.lb
-        .slow_link_measured
-        .store(rc.measured, Ordering::Relaxed);
+    let mut rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64).lowbw(&cfg);
+    let mut lb = lowbw::CaptureState::new(&cfg, &hub);
     hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
-    let mut last_paintover = false;
-    let mut sweep: Option<Sweep> = None;
-    let sweep_qps = crate::sweep::qp_range(cfg.paintover_crf);
     let mut had_clients = false;
     let mut full_next = true;
     let mut refiner = Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16));
@@ -790,12 +603,7 @@ fn capture_loop(
         let clients = hub.video_clients();
         if clients.is_empty() {
             if had_clients {
-                rc = RateCtl::new(
-                    cfg.max_kbps as f64,
-                    cfg.min_kbps as f64,
-                    cfg.start_kbps as f64,
-                );
-                rc.measured = cfg.fast_paintover_delay_ms.is_some();
+                rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64).lowbw(&cfg);
                 hub.lb.congested.store(false, Ordering::Relaxed);
                 hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
             }
@@ -804,15 +612,7 @@ fn capture_loop(
             continue;
         }
         rc.update(&hub, &clients);
-        hub.lb.slow_link.store(rc.slow_link, Ordering::Relaxed);
-        let eff_fps = if cfg.adaptive_fps {
-            rc.effective_fps(cfg.fps)
-        } else {
-            cfg.fps
-        };
-        let eff_interval = Duration::from_secs_f64(1.0 / eff_fps.max(1) as f64);
-        let eff_min_interval = eff_interval.mul_f64(0.85);
-        let eff_interval_ms = eff_interval.as_secs_f64() * 1000.0;
+        let (min_interval, interval_ms) = lb.pace(&hub, &rc, (min_interval, interval_ms));
         // A draining viewer would not be sent the keyframe, so its requests wait.
         let want_key = clients.iter().any(|c| {
             c.needs_keyframe.load(Ordering::Relaxed) && !c.lb.draining.load(Ordering::SeqCst)
@@ -825,65 +625,22 @@ fn capture_loop(
             cap.damaged = true;
             full_next = true;
         }
-        // With --fast-paintover-delay-ms a link measured fast sharpens sooner; paint-overs
-        // never run while congested.
-        let fast_delay = cfg.fast_paintover_delay_ms.filter(|_| !rc.slow_link);
-        let paintover_delay_ms = fast_delay.unwrap_or(cfg.paintover_delay_ms);
-        // On a link measured fast, with AQ, a paint-over is a sweep. A keyframe, a viewer
-        // that isn't measured fast and congestion end it (motion does, below). So does a
-        // stalled viewer, until its restart keyframe is acked: the link floor leaves it out
-        // until that keyframe is sent, and passes queued meanwhile would follow it.
-        let stalled = clients.iter().any(|c| c.lb.stalled.load(Ordering::SeqCst));
-        let sweeping = fast_delay.is_some()
-            && !rc.congested
-            && !want_key
-            && !stalled
-            && sweep_layout.is_some();
-        // A pass's blocks stop being pending once it is coded, before this capture's
-        // changes are marked.
-        let mut next = sweep.as_mut().map(|s| s.wait(&mut refiner.pending));
-        if let Some(Next::Restart) = next {
-            refiner.mark_all();
+        lb.begin(&rc, &clients, want_key);
+        if lb.sweep_restarts(&mut refiner) {
             paintover_left = cfg.paintover_burst.max(1);
-            sweep = None;
         }
-        if !sweeping || sweep.is_none() {
-            sweep = None;
-            next = None;
-        }
-        let mut paintover_due = paintover_left > 0
-            && !rc.congested
-            && last_motion.elapsed() >= Duration::from_millis(paintover_delay_ms);
-        // A sweep's next pass waits for the last one's size (the encoder wakes us), then
-        // for the link to carry it.
-        let mut sweep_wait = None;
-        if paintover_due {
-            match next {
-                Some(Next::Report) => sweep_wait = Some(100),
-                Some(Next::After(d)) if !d.is_zero() => sweep_wait = Some(d.as_millis() as i32 + 1),
-                _ => {}
-            }
-            paintover_due = sweep_wait.is_none();
-        }
+        let paintover_due = paintover_left > 0
+            && !rc.lb.congested
+            && last_motion.elapsed() >= Duration::from_millis(lb.paintover_delay_ms);
+        let paintover_due = lb.sweep_due(paintover_due);
         if !cap.damaged && !want_key && !paintover_due {
-            let wait = paintover_delay_ms.saturating_sub(last_motion.elapsed().as_millis() as u64);
-            // A paint-over that is due but held back by congestion re-checks at the rate
-            // controller's pace instead of spinning.
-            let timeout = if let Some(t) = sweep_wait {
-                t
-            } else if paintover_left == 0 || wait == 0 {
-                100
-            } else {
-                wait as i32 + 1
-            };
+            let timeout = lb.idle_timeout(paintover_left, last_motion);
             wait_any(&[cap.fd(), hub.waker.waitable()], timeout);
             continue;
         }
         let since = last_capture.elapsed();
-        // Motion right after a paint-over pass goes out at once: the pass was extra.
-        let skip_interval = fast_delay.is_some() && last_paintover && cap.damaged;
-        if since < eff_min_interval && !skip_interval {
-            let rem = eff_min_interval - since;
+        if since < min_interval && !lb.skip_interval(cap.damaged) {
+            let rem = min_interval - since;
             wait_any(
                 &[hub.waker.waitable()],
                 (rem.as_micros() as i32 + 999) / 1000,
@@ -900,7 +657,7 @@ fn capture_loop(
                 continue;
             }
         }
-        if !want_key && !flow_ok(&hub, eff_interval_ms) {
+        if !want_key && !flow_ok(&hub, interval_ms) {
             hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
             wait_any(&[cap.fd(), hub.waker.waitable()], 4);
             continue;
@@ -956,24 +713,11 @@ fn capture_loop(
             continue;
         }
         // Sharpen only what was sent at motion quality; nothing pending, nothing to send.
-        // A sweep takes the next run of it, sized for the link.
-        let mut sweep_pass = None;
         let paint_map = if paintover_due && !is_motion && !want_key {
-            let next = match (sweeping, &sweep_layout) {
-                (true, Some(layout)) => sweep
-                    .get_or_insert_with(|| Sweep::new(layout, refiner.cols, sweep_qps))
-                    .plan(&refiner.pending, rc.capacity_kbps, eff_min_interval)
-                    .map(|p| {
-                        sweep_pass = Some((p.job, p.last));
-                        (p.map, p.band)
-                    }),
-                _ => refiner.pending_map(),
-            };
-            match next {
+            match lb.paint_map(&refiner, &rc, min_interval) {
                 Some(m) => Some(m),
                 None => {
                     paintover_left = 0;
-                    sweep = None;
                     continue;
                 }
             }
@@ -1003,28 +747,19 @@ fn capture_loop(
         hub.stats.captured.fetch_add(1, Ordering::Relaxed);
 
         let mut refine = None;
-        let mut paintover_first = false;
         let paintover = if is_motion {
             last_motion = Instant::now();
             paintover_left = cfg.paintover_burst;
-            sweep = None;
-            // Piggyback sharpening of blocks that have gone still on this frame, unless
-            // the link is currently congested.
-            refine = if want_key || rc.congested || cfg.paintover_burst == 0 {
+            lb.sweep = None;
+            // Piggyback sharpening of blocks that have gone still on this frame.
+            refine = if want_key {
                 None
             } else {
-                refiner.due(rc.slow_link, fast_delay.is_some())
+                lb.refine(&mut refiner, &rc)
             };
             refine.is_some()
         } else if paintover_due {
-            // A sweep runs until nothing is pending, which its next pass finds out once
-            // this one is coded.
-            if sweep_pass.is_none() {
-                paintover_first = fast_delay.is_some()
-                    && paintover_left == cfg.paintover_burst.max(1)
-                    && !want_key;
-                paintover_left -= 1;
-            }
+            lb.paintover_pass(&mut paintover_left, want_key);
             hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -1037,12 +772,12 @@ fn capture_loop(
             {
                 c.needs_keyframe.store(false, Ordering::Relaxed);
             }
-            // A keyframe is squeezed into the rate cap; sharpen all of it once still,
-            // even when the screen does not move again.
+            // A keyframe is squeezed into the rate cap; sharpen all of it once still.
             refiner.mark_all();
+            // Even when the screen does not move again.
             paintover_left = cfg.paintover_burst.max(1);
             last_motion = Instant::now();
-            sweep = None;
+            lb.sweep = None;
         }
         let frame_paintover = paintover && refine.is_none();
         if frame_paintover && paintover_left == 0 {
@@ -1074,7 +809,6 @@ fn capture_loop(
             mb_dirty.take().map(Arc::new)
         };
         last_capture = t0;
-        last_paintover = frame_paintover;
         next_idx = 1 - idx;
         if job_tx
             .send(Job {
@@ -1082,16 +816,12 @@ fn capture_loop(
                 idx,
                 force_idr: want_key,
                 paintover,
-                paintover_first: frame_paintover && paintover_first,
-                paintover_final: frame_paintover
-                    && (paintover_left == 0 || sweep_pass.as_ref().is_some_and(|p| p.1)),
-                sweep: sweep_pass.map(|(j, _)| j),
+                paintover_final: frame_paintover && (paintover_left == 0 || lb.last_pass()),
                 mb_dirty: mb_map,
                 band,
                 captured_at: origin,
                 marker_ms,
-                rate_scale: cfg.fps.max(1) as f64 / eff_fps.max(1) as f64,
-                rate: rc.snapshot(),
+                lb: lb.job(frame_paintover, &rc),
             })
             .is_err()
         {
@@ -1148,15 +878,11 @@ struct StripeJob {
     paintover: bool,
     crf: f32,
     cap: u32,
-    /// The rate controller sees a slow link (`RateSnapshot::slow_link`).
-    slow_link: bool,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
-    /// A sweep pass at this QP: `mb_dirty` marks its blocks, the rest are skipped.
-    sweep_qp: Option<i32>,
+    lb: lowbw::StripeJobState,
 }
 
-/// A stripe's output: keyframe, bytes.
 type StripeResult = (usize, Option<(bool, Vec<u8>)>);
 
 /// x264's sliced threading costs ~3x the CPU of one thread on desktop content (and on
@@ -1342,7 +1068,6 @@ fn stripe_worker(
     rx: mpsc::Receiver<StripeJob>,
     done: mpsc::Sender<StripeResult>,
     debug: bool,
-    motion_quality: bool,
 ) {
     let mut gov = ThreadGovernor {
         threads: 1,
@@ -1354,39 +1079,26 @@ fn stripe_worker(
         predicted_ms: 0.0,
     };
     let mut motion = MotionQuality::default();
-    // The encoder was just reopened: its next frame is an IDR, which can't be a sweep
-    // pass (the blocks outside the pass would be coded at QP 51).
-    let mut fresh = false;
+    let mut lb = lowbw::WorkerState::default();
     while let Ok(job) = rx.recv() {
         let buf = unsafe { &*job.buf.0 };
         let is_motion = !job.force_idr && !job.paintover;
-        let crf = if is_motion && motion_quality {
+        let crf = if is_motion && job.lb.motion_quality {
             motion.crf(job.crf)
         } else {
             job.crf
         };
-        let was_fresh = std::mem::take(&mut fresh);
-        let sweep_qp = job.sweep_qp.filter(|_| !was_fresh);
+        let sweep_qp = lb.set_qp(&mut s.enc, &job, crf);
         if sweep_qp.is_some() {
-            // The VBV cap stays the last motion frame's, and takes the pass's bytes.
-            s.enc.begin_forced_qp();
+            // A sweep pass: the VBV cap stays the last motion frame's, and takes its bytes.
         } else if job.force_idr {
-            s.enc.end_forced_qp(crf);
-            // A keyframe is what a new viewer sees first. Give it up to ~8 frames at 4x
-            // the cap; on a slow link keep the single IDR within ~1.25 s of the cap so it
-            // does not trip the stall resync loop.
-            if !job.slow_link {
-                let boost = job.cap.saturating_mul(4).max(16_000);
-                s.enc
-                    .set_rate_buf(job.crf, boost, boost / s.cfg.fps.max(1) * 8);
-            } else {
-                let boost = job.cap.saturating_mul(2).max(400);
-                let buf_kbit = (job.cap * 5 / 4).max(120);
-                s.enc.set_rate_buf(job.crf, boost, buf_kbit);
-            }
+            // A keyframe is what a new viewer sees first; don't starve it to the
+            // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
+            let boost = job.cap.saturating_mul(4).max(16_000);
+            let (boost, buf_kbit) = lowbw::key_rate(&job, (boost, boost / s.cfg.fps.max(1) * 8));
+            s.enc.set_rate_buf(job.crf, boost, buf_kbit);
             s.applied_kbps = 0;
         } else {
-            s.enc.end_forced_qp(crf);
             let moved = s.applied_kbps == 0
                 || (job.cap as f64 - s.applied_kbps as f64).abs() > s.applied_kbps as f64 * 0.04;
             if crf != s.applied_crf || moved {
@@ -1406,34 +1118,32 @@ fn stripe_worker(
         let mut out = Vec::with_capacity(64 << 10);
         out.resize(HDR, 0);
         // x264 wants X264_MBINFO_CONSTANT (1) on unchanged macroblocks of this stripe.
-        let stripe_map = job.mb_dirty.as_ref().map(|d| {
+        let mut info = job.mb_dirty.as_ref().map(|d| {
+            let rows = s.h.div_ceil(16);
             let start = (s.y / 16) * job.mb_cols;
-            &d[start..start + s.h.div_ceil(16) * job.mb_cols]
+            d[start..start + rows * job.mb_cols]
+                .iter()
+                .map(|&x| (x == 0) as u8)
+                .collect::<Vec<u8>>()
         });
-        let (mut info, mut offsets) = match (stripe_map, sweep_qp) {
-            (Some(m), Some(_)) => {
-                let (i, o) = crate::sweep::stripe_hints(m);
-                (Some(i), Some(o))
-            }
-            (m, _) => (
-                m.map(|m| m.iter().map(|&x| (x == 0) as u8).collect::<Vec<u8>>()),
-                None,
-            ),
-        };
+        let mut offsets = sweep_qp.and(info.as_deref()).map(lowbw::quant_offsets);
         // Changed macroblocks in this stripe (all of them without a damage map).
         let stripe_mbs = s.h.div_ceil(16) * job.mb_cols;
         let changed = info
             .as_ref()
             .map_or(stripe_mbs, |m| m.iter().filter(|&&c| c == 0).count());
         let te = Instant::now();
-        let hints = Hints {
-            qp: sweep_qp,
-            mb_info: info.as_deref_mut(),
-            quant_offsets: offsets.as_deref_mut(),
-        };
-        let r = s
-            .enc
-            .encode_hinted(&planes, job.ts, job.force_idr, hints, &mut out);
+        let r = s.enc.encode_hinted(
+            &planes,
+            job.ts,
+            job.force_idr,
+            crate::encoder::Hints {
+                qp: sweep_qp,
+                mb_info: info.as_deref_mut(),
+                quant_offsets: offsets.as_deref_mut(),
+            },
+            &mut out,
+        );
         if debug {
             let cpu_now = thread_cpu_us();
             log::info!(
@@ -1445,7 +1155,7 @@ fn stripe_worker(
             );
         }
         // Not between a sweep's passes: the reopened encoder's IDR would end the sweep.
-        if s.max_threads > 1 && job.sweep_qp.is_none() {
+        if s.max_threads > 1 && job.lb.sweep_qp.is_none() {
             if let Some(t) = gov.want(
                 te.elapsed().as_secs_f64() * 1000.0,
                 changed as f64,
@@ -1463,7 +1173,7 @@ fn stripe_worker(
                         // A fresh encoder opens with an IDR on its next frame, and
                         // its rate control starts over.
                         s.enc = e;
-                        fresh = true;
+                        lb.fresh = true;
                         motion = MotionQuality::default();
                         s.applied_kbps = 0;
                         gov.threads = t;
@@ -1499,7 +1209,6 @@ fn stripe_worker(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_loop(
     stripes_in: Vec<Stripe>,
     rx: mpsc::Receiver<Job>,
@@ -1507,15 +1216,12 @@ fn encode_loop(
     hub: Arc<Hub>,
     crf: f32,
     po_crf: f32,
-    min_kbps: u32,
-    motion_quality: bool,
 ) {
     let epoch = Instant::now();
     // Ids go on across display rebuilds, so an ack for a frame of the last pipeline
     // can't be read as one for this one's.
     let mut frame_id = hub.lb.frame_id.load(Ordering::Relaxed);
     let n = stripes_in.len();
-    let fps = stripes_in.first().map_or(30, |s| s.cfg.fps.max(1));
     let debug_stripes = std::env::var("VOXL_DEBUG_STRIPES").is_ok();
     // Geometry and paint-over bookkeeping stay here; encoders move to their workers.
     let mut stripes: Vec<(usize, usize, bool)> =
@@ -1529,127 +1235,49 @@ fn encode_loop(
             let done = done_tx.clone();
             let h = std::thread::Builder::new()
                 .name(format!("enc-{i}"))
-                .spawn(move || stripe_worker(i, s, rx, done, debug_stripes, motion_quality))
+                .spawn(move || stripe_worker(i, s, rx, done, debug_stripes))
                 .unwrap();
             (tx, h)
         })
         .collect();
     while let Ok(job) = rx.recv() {
         let t0 = Instant::now();
-        // A sweep pass codes the stripes it has blocks in.
-        let selected: Vec<bool> = match &job.sweep {
-            Some(p) => p.per_stripe.iter().map(|&b| b > 0).collect(),
-            None => stripes
-                .iter()
-                .map(|&(y, h, touched)| {
-                    job.force_idr
-                        || (job.paintover && touched)
-                        || job
-                            .band
-                            .is_some_and(|b| (b.y0 as usize) < y + h && (b.y1 as usize) > y)
-                })
-                .collect(),
-        };
+        let selected: Vec<bool> = stripes
+            .iter()
+            .map(|&(y, h, touched)| {
+                job.force_idr
+                    || (job.paintover && touched)
+                    || job
+                        .band
+                        .is_some_and(|b| (b.y0 as usize) < y + h && (b.y1 as usize) > y)
+            })
+            .collect();
+        let selected = lowbw::sweep_stripes(&job, selected);
         if !selected.iter().any(|&x| x) {
-            if let Some(p) = &job.sweep {
-                let _ = p.report.set(Outcome {
-                    bytes: vec![None; n],
-                    keyframe: false,
-                    sent: Instant::now(),
-                });
-                hub.wake();
-            }
+            lowbw::report_skipped(&job, &hub, n);
             let _ = ret.send((job.idx, job.buf));
             continue;
         }
-        let RateSnapshot {
-            target_kbps,
-            congested,
-            slow_link,
-            capacity_kbps,
-            measured,
-        } = job.rate;
-        // Measured links use the capture-time snapshot (it matches `rate_scale`); without
-        // them the rate is read live, at encode.
-        let (target, congested, slow_link) = if measured {
-            (target_kbps, congested, slow_link)
-        } else {
-            let t = hub.target_kbps.load(Ordering::Relaxed);
-            (
-                t,
-                hub.lb.congested.load(Ordering::Relaxed),
-                t < SLOW_LINK_KBPS,
-            )
-        };
-        // With measured links a keyframe starts the viewers that have not started (joining
-        // or restarting) as of now; if any of them is not measured fast, it takes the slow
-        // path, sized from at most `UNMEASURED_KEY_KBPS`. One that joins during the encode
-        // waits for the next keyframe.
-        let key_for: Option<Vec<u64>> = (job.force_idr && measured).then(|| {
-            hub.video_clients()
-                .iter()
-                .filter(|c| {
-                    !c.lb.draining.load(Ordering::SeqCst) && !c.started.load(Ordering::SeqCst)
-                })
-                .map(|c| c.id)
-                .collect()
-        });
-        let key_slow = key_for.as_ref().is_some_and(|ids| {
-            hub.video_clients()
-                .iter()
-                .any(|c| ids.contains(&c.id) && c.link_kbps() < SLOW_LINK_KBPS)
-        });
-        let want_crf = if job.paintover {
-            po_crf
-        } else if slow_link && congested && target <= min_kbps.saturating_mul(3) / 2 {
-            // Smoothly raise QP when pinned near the floor instead of letting VBV slam QP 51.
-            (crf + 4.0).min(38.0)
-        } else {
-            crf
-        };
+        let target = hub.target_kbps.load(Ordering::Relaxed);
+        let lb = lowbw::EncodePlan::new(&job, &hub, (target, n));
+        let target = lb.target;
+        let want_crf = if job.paintover { po_crf } else { lb.crf(crf) };
         // Each stripe may use up to twice its area share of the budget; the delay-based
-        // controller reins the total in if several stripes move at once. A single stripe
-        // on a slow link gets the exact target, since one burst at 2x already queues.
-        let (slow_link, target) = if key_slow {
-            (true, target.min(UNMEASURED_KEY_KBPS))
-        } else {
-            (slow_link, target)
-        };
-        let share = if slow_link && n == 1 {
-            target.max(1)
-        } else {
-            ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
-        };
-        // On a link measured fast every paint-over and refine pass fits ~50 ms of measured
-        // delivery (its VBV buffers hold 1.25 frames of cap each); a pass that can't reach
-        // the paint-over CRF in it leaves the rest to the next.
-        let fast = measured && !slow_link;
-        let budget = (capacity_kbps as u64 * fps as u64 / (25 * n as u64)) as u32;
+        // controller reins the total in if several stripes move at once.
+        let share = ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32;
+        let share = lb.share(share, n);
         let ts = job.captured_at.duration_since(epoch).as_millis() as i64;
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
         let buf_ptr = SendPtr(&*job.buf as *const I420);
         let mut pending = 0;
         for (i, &on) in selected.iter().enumerate() {
             if on {
-                let cap = if job.paintover && !slow_link {
+                let cap = if job.paintover && !lb.slow_link {
                     share.saturating_mul(2)
                 } else {
                     share
                 };
-                // Keyframes keep the unscaled cap: their size is bounded on its own.
-                let cap = if job.force_idr {
-                    cap
-                } else {
-                    (cap as f64 * job.rate_scale).round() as u32
-                };
-                // The first fast pass may take up to 4x share where acks show twice the
-                // target, so it can reach the paint-over CRF in one frame.
-                let cap = if fast && job.paintover && !job.force_idr {
-                    let first = job.paintover_first && !congested && capacity_kbps / 2 >= target;
-                    if first { cap.saturating_mul(2) } else { cap }.min(budget)
-                } else {
-                    cap
-                };
+                let cap = lb.cap(&job, cap);
                 let _ = workers[i].0.send(StripeJob {
                     buf: buf_ptr,
                     ts,
@@ -1657,10 +1285,9 @@ fn encode_loop(
                     paintover: job.paintover,
                     crf: want_crf,
                     cap,
-                    slow_link,
                     mb_dirty: job.mb_dirty.clone(),
                     mb_cols: job.buf.width.div_ceil(16),
-                    sweep_qp: job.sweep.as_ref().map(|p| p.qp),
+                    lb: lb.stripe_job(&job),
                 });
                 pending += 1;
             }
@@ -1671,18 +1298,7 @@ fn encode_loop(
                 results[i] = r;
             }
         }
-        // A sweep pass's report goes in once the pass is queued for sending.
-        let mut report = job.sweep.as_ref().map(|p| {
-            let outcome = Outcome {
-                bytes: results
-                    .iter()
-                    .map(|r| r.as_ref().map(|r| r.1.len() - HDR))
-                    .collect(),
-                keyframe: results.iter().flatten().any(|r| r.0),
-                sent: Instant::now(),
-            };
-            (p.report.clone(), outcome)
-        });
+        let mut report = lowbw::PassReport::new(&job, &results);
         let _ = ret.send((job.idx, job.buf));
         for (y, h, touched) in stripes.iter_mut() {
             if job.paintover_final {
@@ -1701,10 +1317,7 @@ fn encode_loop(
             .filter_map(|(i, r)| r.map(|(k, o)| (i, k, o)))
             .collect();
         if parts.is_empty() {
-            if let Some((r, o)) = report.take() {
-                let _ = r.set(o);
-                hub.wake();
-            }
+            report.file(&hub, None);
             continue;
         }
         let enc_us = t0.elapsed().as_micros() as u64;
@@ -1747,26 +1360,8 @@ fn encode_loop(
         let now = Instant::now();
         for c in hub.video_clients() {
             let mut q = c.inflight.lock();
-            // Checked under the lock `mark_stalled` takes, so nothing is queued after it.
-            if c.lb.draining.load(Ordering::SeqCst) {
+            if !lb.admit(&c, &mut q, (all_key, frame_id)) {
                 continue;
-            }
-            if !c.started.load(Ordering::SeqCst) {
-                // With measured links only a forced keyframe starts a viewer, the one sized
-                // for it: not an IDR from an encoder that reopened with new threads.
-                let for_it = match &key_for {
-                    Some(ids) => ids.contains(&c.id),
-                    None => !measured,
-                };
-                if !all_key || !for_it {
-                    continue;
-                }
-                if c.lb.stalled.load(Ordering::SeqCst) {
-                    // The restart keyframe: acking it ends the stall.
-                    c.lb.resync_id.store(frame_id, Ordering::SeqCst);
-                }
-                c.started.store(true, Ordering::SeqCst);
-                q.clear();
             }
             if q.len() > 600 {
                 log::warn!("client {} hopelessly behind; dropping", c.id);
@@ -1784,11 +1379,7 @@ fn encode_loop(
                 c.send(Out::Bin(m.clone()));
             }
         }
-        if let Some((r, mut o)) = report.take() {
-            o.sent = now;
-            let _ = r.set(o);
-            hub.wake();
-        }
+        report.file(&hub, Some(now));
         hub.stats.send_lat_us.fetch_add(
             job.captured_at.elapsed().as_micros() as u64,
             Ordering::Relaxed,
