@@ -243,7 +243,7 @@ function flush() {
 					g.frame.close();
 				}
 		}
-		send(cmd.ack(id));
+		send(cmd.ack(id, Math.round(performance.now() - f.t0)));
 		st.frames++;
 		st.decodeMs += performance.now() - f.t0;
 	}

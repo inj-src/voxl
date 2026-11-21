@@ -59,7 +59,8 @@ export type ServerMessage =
 
 /** Text commands to the server. */
 export const cmd = {
-	ack: (frame: number) => `a,${frame}`,
+	/** `holdMs`: from the frame's arrival to this ack (decode and present). */
+	ack: (frame: number, holdMs: number) => `a,${frame},${holdMs}`,
 	move: (x: number, y: number) => `m,${x},${y}`,
 	button: (button: number, down: boolean) => `b,${button},${down ? 1 : 0}`,
 	/** Scroll in desktop pixels; the server turns it into smooth scrolling or wheel clicks. */

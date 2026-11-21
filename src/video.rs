@@ -69,7 +69,13 @@ struct RateSnapshot {
     slow_link: bool,
     /// The slowest active viewer's last delivery sample (0: unmeasured).
     capacity_kbps: u32,
+    /// `--fast-paintover-delay-ms` is set: `slow_link` comes from delivery samples.
+    measured: bool,
 }
+
+/// The rate a keyframe for a viewer not yet measured fast is sized from, whatever
+/// `--start-kbps` is, so its first picture crosses a slow link well within the stall limit.
+const UNMEASURED_KEY_KBPS: u32 = 1500;
 
 fn union(a: Option<Band>, b: Band) -> Band {
     match a {
@@ -364,11 +370,14 @@ struct RateCtl {
     ceiling: f64,
     ceiling_at: Instant,
     congested: bool,
-    /// Some active viewer is unmeasured or measured under `SLOW_LINK_KBPS`, or
-    /// `--max-kbps` is under it. Leaves only on a fast delivery sample from every viewer.
+    /// The target is under `SLOW_LINK_KBPS`. When `measured`: instead, some active viewer
+    /// is unmeasured or measured under it, or `--max-kbps` is under it; it leaves only
+    /// on a fast delivery sample from every viewer.
     slow_link: bool,
     /// The slowest active viewer's last delivery sample (kbit/s, 0: unmeasured).
     capacity_kbps: u32,
+    /// `--fast-paintover-delay-ms` is set.
+    measured: bool,
 }
 
 impl RateCtl {
@@ -388,6 +397,7 @@ impl RateCtl {
             congested: false,
             slow_link: true,
             capacity_kbps: 0,
+            measured: false,
         }
     }
 
@@ -397,7 +407,27 @@ impl RateCtl {
             congested: self.congested,
             slow_link: self.slow_link,
             capacity_kbps: self.capacity_kbps,
+            measured: self.measured,
         }
+    }
+
+    /// Recomputes `slow_link` from the viewers now watching, so a join, leave or restart
+    /// counts at once rather than on the next rate tick.
+    fn refresh_link(&mut self, clients: &[Arc<crate::hub::Client>]) {
+        let healthy = clients.iter().any(|c| !c.stalled.load(Ordering::SeqCst));
+        // A viewer that joined is unmeasured (0) until its keyframe is acked.
+        self.capacity_kbps = clients
+            .iter()
+            .filter(|c| !(healthy && c.stalled.load(Ordering::SeqCst)))
+            .map(|c| c.link_kbps.load(Ordering::Relaxed))
+            .min()
+            .unwrap_or(0);
+        let slow = SLOW_LINK_KBPS as f64;
+        self.slow_link = if self.measured {
+            self.max < slow || self.capacity_kbps < SLOW_LINK_KBPS
+        } else {
+            self.target < slow
+        };
     }
 
     /// Capture FPS ceiling adjusted for current bandwidth target and congestion.
@@ -418,6 +448,7 @@ impl RateCtl {
 
     fn update(&mut self, hub: &Hub, clients: &[Arc<crate::hub::Client>]) {
         if self.last_eval.elapsed() < Duration::from_millis(100) {
+            self.refresh_link(clients);
             return;
         }
         self.last_eval = Instant::now();
@@ -526,19 +557,11 @@ impl RateCtl {
         // a fast delivery sample (`Client::link_kbps`) says otherwise.
         if self.target < SLOW_LINK_KBPS as f64 {
             for c in hit {
-                c.link_kbps.store(0, Ordering::Relaxed);
+                c.reset_link();
             }
         }
-        // A viewer that joined is unmeasured (0) until its keyframe is acked.
-        let capacity = clients
-            .iter()
-            .filter(|c| !(healthy && c.stalled.load(Ordering::SeqCst)))
-            .map(|c| c.link_kbps.load(Ordering::Relaxed))
-            .min()
-            .unwrap_or(0);
-        self.capacity_kbps = capacity;
-        self.slow_link = self.max < SLOW_LINK_KBPS as f64 || capacity < SLOW_LINK_KBPS;
         self.congested = congested;
+        self.refresh_link(clients);
         hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
     }
 }
@@ -688,6 +711,7 @@ fn capture_loop(
         cfg.min_kbps as f64,
         cfg.start_kbps as f64,
     );
+    rc.measured = cfg.fast_paintover_delay_ms.is_some();
     hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
     let mut last_paintover = false;
     let mut had_clients = false;
@@ -739,6 +763,7 @@ fn capture_loop(
                     cfg.min_kbps as f64,
                     cfg.start_kbps as f64,
                 );
+                rc.measured = cfg.fast_paintover_delay_ms.is_some();
                 hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
             }
             had_clients = false;
@@ -787,7 +812,8 @@ fn capture_loop(
         }
         let since = last_capture.elapsed();
         // Motion right after a paint-over pass goes out at once: the pass was extra.
-        if since < eff_min_interval && !(last_paintover && cap.damaged) {
+        let skip_interval = cfg.fast_paintover_delay_ms.is_some() && last_paintover && cap.damaged;
+        if since < eff_min_interval && !skip_interval {
             let rem = eff_min_interval - since;
             wait_any(
                 &[hub.waker.waitable()],
@@ -1412,7 +1438,18 @@ fn encode_loop(
             congested,
             slow_link,
             capacity_kbps,
+            measured,
         } = job.rate;
+        // A keyframe goes to every viewer that has not started (joining or restarting).
+        // With measured links, any of them not measured fast gets the slow keyframe, sized
+        // from at most `UNMEASURED_KEY_KBPS`; the recipients are looked up now, at encode.
+        let key_slow = job.force_idr
+            && measured
+            && hub.video_clients().iter().any(|c| {
+                !c.draining.load(Ordering::SeqCst)
+                    && !c.started.load(Ordering::SeqCst)
+                    && c.link_kbps.load(Ordering::Relaxed) < SLOW_LINK_KBPS
+            });
         let want_crf = if job.paintover {
             po_crf
         } else if slow_link && congested && target <= min_kbps.saturating_mul(3) / 2 {
@@ -1424,11 +1461,20 @@ fn encode_loop(
         // Each stripe may use up to twice its area share of the budget; the delay-based
         // controller reins the total in if several stripes move at once. A single stripe
         // on a slow link gets the exact target, since one burst at 2x already queues.
+        let (slow_link, target) = if key_slow {
+            (true, target.min(UNMEASURED_KEY_KBPS))
+        } else {
+            (slow_link, target)
+        };
         let share = if slow_link && n == 1 {
             target.max(1)
         } else {
             ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
         };
+        // On a link measured fast every paint-over and refine pass fits ~100 ms of measured
+        // delivery: its VBV buffers hold 1.25 frames of cap each.
+        let fast = measured && !slow_link;
+        let budget = (capacity_kbps as u64 * fps as u64 * 2 / (25 * n as u64)) as u32;
         let ts = job.captured_at.duration_since(epoch).as_millis() as i64;
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
         let buf_ptr = SendPtr(&*job.buf as *const I420);
@@ -1446,16 +1492,11 @@ fn encode_loop(
                 } else {
                     (cap as f64 * job.rate_scale).round() as u32
                 };
-                // The first fast paint-over pass may reach the paint-over CRF in one frame
-                // where acks show twice the target: up to 4x share, and its VBV buffers
-                // (1.25 frames of cap each) hold at most ~100 ms of measured delivery.
-                let cap = if job.paintover_first
-                    && !slow_link
-                    && !congested
-                    && capacity_kbps / 2 >= target
-                {
-                    let bound = (capacity_kbps as u64 * fps as u64 * 2 / (25 * n as u64)) as u32;
-                    cap.saturating_mul(2).min(bound).max(cap)
+                // The first fast pass may take up to 4x share where acks show twice the
+                // target, so it can reach the paint-over CRF in one frame.
+                let cap = if fast && job.paintover && !job.force_idr {
+                    let first = job.paintover_first && !congested && capacity_kbps / 2 >= target;
+                    if first { cap.saturating_mul(2) } else { cap }.min(budget)
                 } else {
                     cap
                 };

@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 pub enum Out {
@@ -35,12 +35,11 @@ pub struct Client {
     pub delay: Mutex<DelayEst>,
     /// Cursor image IDs already sent to this client (capped FIFO for cache hits).
     pub known_cursors: Mutex<VecDeque<u32>>,
-    /// Last delivery-rate sample from acks (kbit/s); 0 until one is measured and after
-    /// congestion or a stall. Under `SLOW_LINK_KBPS` the session counts as a slow link.
+    /// Delivery rate from acks (kbit/s): the best sample of the last `LINK_WINDOW`;
+    /// 0 until one is measured and after congestion or a stall. Under `SLOW_LINK_KBPS`
+    /// the viewer counts as a slow link.
     pub link_kbps: AtomicU32,
-    /// When the last ack arrived: a frame queued behind the previous one starts arriving
-    /// only after that one did.
-    pub last_ack: Mutex<Option<Instant>>,
+    pub link: Mutex<LinkEst>,
     /// Went too long without acking (hidden tab, dead or saturated socket): left out of
     /// flow control and rate control until it acks the keyframe that restarts it.
     pub stalled: AtomicBool,
@@ -62,9 +61,28 @@ pub struct DelayEst {
 /// A link counts as slow until its acks show it delivers at least this (kbit/s).
 pub const SLOW_LINK_KBPS: u32 = 2000;
 
-/// Smallest ack worth a delivery sample: 25 ms at `SLOW_LINK_KBPS`, well above the
-/// timing noise of small frames.
-const LINK_SAMPLE_MIN_BYTES: usize = 6_250;
+/// Bytes a delivery sample needs: 50 ms at `SLOW_LINK_KBPS`, well above RTT jitter.
+/// Smaller frames are added up until they reach it.
+const LINK_SAMPLE_MIN_BYTES: usize = 12_500;
+/// Shortest delivery time a sample may span, and the closest two acks may arrive and
+/// still both count: a retransmit releases several acks at once.
+const LINK_SAMPLE_MIN_MS: f64 = 10.0;
+/// `link_kbps` is the best sample this recent, so one slow frame (decode, jitter) does
+/// not decide the verdict.
+const LINK_WINDOW: Duration = Duration::from_secs(2);
+
+/// Delivery samples for `Client::link_kbps`.
+#[derive(Default)]
+pub struct LinkEst {
+    /// When the last acked frame reached the viewer (ack time minus its hold).
+    last_arrival: Option<Instant>,
+    /// Frames too small to sample alone, added up: bytes, delivery ms, first added.
+    pool_bytes: usize,
+    pool_ms: f64,
+    pool_at: Option<Instant>,
+    /// Samples (kbit/s, when) of the last `LINK_WINDOW`.
+    samples: VecDeque<(u32, Instant)>,
+}
 
 pub struct RateEst {
     pub window_start: Instant,
@@ -77,7 +95,9 @@ impl Client {
         let _ = self.tx.send(m);
     }
 
-    pub fn on_ack(&self, id: u32) {
+    /// `hold_ms`: how long the viewer held the frame before acking it (decode and
+    /// present), 0 from a viewer that does not say.
+    pub fn on_ack(&self, id: u32, hold_ms: u32) {
         let mut q = self.inflight.lock();
         let mut acked = 0;
         let mut sample = None;
@@ -96,7 +116,7 @@ impl Client {
         }
         drop(q);
         if let Some(sent) = first_sent {
-            self.sample_link(sent, acked);
+            self.sample_link(sent, acked, hold_ms);
         }
         if self.stalled.load(Ordering::SeqCst)
             && wrapping_le(self.resync_id.load(Ordering::SeqCst), id)
@@ -136,12 +156,18 @@ impl Client {
     }
 
     /// Delivery rate of the frames just acked: their bytes over the time they took to
-    /// arrive (bytes / (ack - send - min RTT), from the previous ack if they queued
-    /// behind it).
-    fn sample_link(&self, sent: Instant, bytes: usize) {
+    /// arrive (bytes / (arrival - send - min RTT), from the previous arrival if they
+    /// queued behind it). Arrival is the ack time minus the viewer's hold.
+    fn sample_link(&self, sent: Instant, bytes: usize, hold_ms: u32) {
         let now = Instant::now();
-        let prev = self.last_ack.lock().replace(now);
-        if bytes < LINK_SAMPLE_MIN_BYTES {
+        let arrived = now
+            .checked_sub(Duration::from_millis(hold_ms.min(10_000) as u64))
+            .unwrap_or(now);
+        let mut l = self.link.lock();
+        let prev = l.last_arrival.replace(arrived);
+        if prev.is_some_and(|p| {
+            arrived.saturating_duration_since(p).as_secs_f64() * 1000.0 < LINK_SAMPLE_MIN_MS
+        }) {
             return;
         }
         // The smaller of the ping RTT and the fastest ack, so a high ping can't inflate it.
@@ -155,14 +181,39 @@ impl Client {
         } else {
             0.0
         };
-        let mut start = sent + std::time::Duration::from_secs_f64(rtt_ms / 1000.0);
+        let mut start = sent + Duration::from_secs_f64(rtt_ms / 1000.0);
         if let Some(p) = prev {
             start = start.max(p);
         }
-        let ms = now.saturating_duration_since(start).as_secs_f64() * 1000.0;
-        let kbps = bytes as f64 * 8.0 / ms.max(1.0);
-        self.link_kbps
-            .store(kbps.min(u32::MAX as f64) as u32, Ordering::Relaxed);
+        if l.pool_at.is_some_and(|t| now - t > LINK_WINDOW) {
+            l.pool_bytes = 0;
+            l.pool_ms = 0.0;
+            l.pool_at = None;
+        }
+        l.pool_at.get_or_insert(now);
+        l.pool_bytes += bytes;
+        l.pool_ms += arrived.saturating_duration_since(start).as_secs_f64() * 1000.0;
+        if l.pool_bytes < LINK_SAMPLE_MIN_BYTES || l.pool_ms < LINK_SAMPLE_MIN_MS {
+            return;
+        }
+        let kbps = (l.pool_bytes as f64 * 8.0 / l.pool_ms).min(u32::MAX as f64) as u32;
+        l.pool_bytes = 0;
+        l.pool_ms = 0.0;
+        l.pool_at = None;
+        l.samples.retain(|&(_, t)| now - t <= LINK_WINDOW);
+        l.samples.push_back((kbps, now));
+        let best = l.samples.iter().map(|&(k, _)| k).max().unwrap_or(0);
+        self.link_kbps.store(best, Ordering::Relaxed);
+    }
+
+    /// Forgets the delivery rate: the viewer counts as a slow link until measured again.
+    pub fn reset_link(&self) {
+        let mut l = self.link.lock();
+        l.pool_bytes = 0;
+        l.pool_ms = 0.0;
+        l.pool_at = None;
+        l.samples.clear();
+        self.link_kbps.store(0, Ordering::Relaxed);
     }
 
     /// Stops video to a client that stopped acking, so it neither gates the healthy
@@ -178,8 +229,8 @@ impl Client {
         }
         self.stalled.store(true, Ordering::SeqCst);
         self.draining.store(true, Ordering::SeqCst);
-        self.link_kbps.store(0, Ordering::Relaxed);
         self.started.store(false, Ordering::SeqCst);
+        self.reset_link();
     }
 
     /// Frames in flight and age of the oldest unacknowledged one.
@@ -414,7 +465,7 @@ impl Hub {
             }),
             known_cursors: Mutex::new(VecDeque::new()),
             link_kbps: AtomicU32::new(0),
-            last_ack: Mutex::new(None),
+            link: Mutex::new(LinkEst::default()),
             stalled: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             resync_id: AtomicU32::new(0),

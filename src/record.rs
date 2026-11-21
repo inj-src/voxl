@@ -176,7 +176,7 @@ async fn collect(
                 None => break,
                 Some(Out::Bin(b)) if b.len() > 16 && b[0] == 0x01 => {
                     // Acknowledge at once, so the recorder never holds the stream back.
-                    client.on_ack(u32::from_be_bytes([b[2], b[3], b[4], b[5]]));
+                    client.on_ack(u32::from_be_bytes([b[2], b[3], b[4], b[5]]), 0);
                     hub.wake();
                     if frames.is_empty() {
                         size = (hub.width.load(Ordering::Relaxed), hub.height.load(Ordering::Relaxed));
