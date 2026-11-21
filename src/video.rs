@@ -41,6 +41,8 @@ struct Job {
     idx: usize,
     force_idr: bool,
     paintover: bool,
+    /// First pass of a frame-level paint-over burst.
+    paintover_first: bool,
     /// Last pass of a paint-over burst.
     paintover_final: bool,
     /// Rows that changed in this capture.
@@ -55,9 +57,14 @@ struct Job {
     rate_scale: f64,
 }
 
-/// The default `--min-kbps`. A session that keeps the default floor never drops below
-/// it, so the slow-link rules gated on it only run where `--min-kbps` was lowered.
+/// The default `--min-kbps`. A session counts as a slow link once the rate controller
+/// has seen the path carry less than this (`RateCtl::slow_link`), so the slow-link rules
+/// only run where `--min-kbps` was lowered.
 const SLOW_LINK_KBPS: u32 = 2000;
+
+/// How long after the last motion a link with headroom starts the paint-over burst.
+/// A slow link waits `--paintover-delay-ms`.
+const PAINTOVER_DELAY_FAST_MS: u64 = 100;
 
 fn union(a: Option<Band>, b: Band) -> Band {
     match a {
@@ -352,6 +359,8 @@ struct RateCtl {
     ceiling: f64,
     ceiling_at: Instant,
     congested: bool,
+    /// See `slow_link`; published as `Hub::slow_link`.
+    slow_link: bool,
 }
 
 impl RateCtl {
@@ -369,7 +378,20 @@ impl RateCtl {
             ceiling: f64::MAX,
             ceiling_at: past,
             congested: false,
+            slow_link: max < SLOW_LINK_KBPS as f64,
         }
+    }
+
+    /// The path has shown it carries less than `SLOW_LINK_KBPS`: a capacity ceiling under
+    /// it that the controller has not yet probed past, or congestion within the last 15 s
+    /// that pushed the target under it. A quiet session on a fast link never counts, even
+    /// while its target sits low because nothing presses against it.
+    fn slow_link(&self) -> bool {
+        let slow = SLOW_LINK_KBPS as f64;
+        self.max < slow
+            || (self.target < slow
+                && (self.ceiling < slow
+                    || (!self.slow_start && self.last_dec.elapsed() < Duration::from_secs(15))))
     }
 
     /// Capture FPS ceiling adjusted for current bandwidth target and congestion.
@@ -493,7 +515,9 @@ impl RateCtl {
             }
         }
         self.congested = congested;
+        self.slow_link = self.slow_link();
         hub.congested.store(congested, Ordering::Relaxed);
+        hub.slow_link.store(self.slow_link, Ordering::Relaxed);
         hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
     }
 }
@@ -511,9 +535,11 @@ struct Refiner {
 }
 
 /// How long a block stays still before it is sharpened, and how often a refinement
-/// pass may run. Slow links wait twice as long so refinement doesn't compete with motion.
-const REFINE_STILL_MS: u32 = 300;
-const REFINE_EVERY: Duration = Duration::from_millis(250);
+/// pass may run. Slow links wait longer so refinement doesn't compete with motion.
+const REFINE_STILL_MS: u32 = 150;
+const REFINE_EVERY: Duration = Duration::from_millis(120);
+const SLOW_REFINE_STILL_MS: u32 = 600;
+const SLOW_REFINE_EVERY: Duration = Duration::from_millis(500);
 
 impl Refiner {
     fn new(blocks: usize, cols: usize) -> Self {
@@ -572,15 +598,19 @@ impl Refiner {
     }
     /// Blocks due for sharpening (1 = refine) and the row band they span.
     fn due(&mut self, slow_link: bool) -> Option<(Vec<u8>, Band)> {
-        let k = if slow_link { 2 } else { 1 };
-        if self.last_refine.elapsed() < REFINE_EVERY * k {
+        let (still_ms, every) = if slow_link {
+            (SLOW_REFINE_STILL_MS, SLOW_REFINE_EVERY)
+        } else {
+            (REFINE_STILL_MS, REFINE_EVERY)
+        };
+        if self.last_refine.elapsed() < every {
             return None;
         }
         let now = self.now();
         let mut map = vec![0u8; self.pending.len()];
         let (mut r0, mut r1, mut any) = (usize::MAX, 0, false);
         for (i, m) in map.iter_mut().enumerate() {
-            if self.pending[i] && now.saturating_sub(self.changed_ms[i]) >= REFINE_STILL_MS * k {
+            if self.pending[i] && now.saturating_sub(self.changed_ms[i]) >= still_ms {
                 *m = 1;
                 self.pending[i] = false;
                 let row = i / self.cols;
@@ -635,6 +665,7 @@ fn capture_loop(
         cfg.start_kbps as f64,
     );
     hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
+    hub.slow_link.store(rc.slow_link, Ordering::Relaxed);
     let mut had_clients = false;
     let mut full_next = true;
     let mut refiner = Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16));
@@ -685,6 +716,7 @@ fn capture_loop(
                     cfg.start_kbps as f64,
                 );
                 hub.congested.store(false, Ordering::Relaxed);
+                hub.slow_link.store(rc.slow_link, Ordering::Relaxed);
                 hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
             }
             had_clients = false;
@@ -712,13 +744,17 @@ fn capture_loop(
             cap.damaged = true;
             full_next = true;
         }
+        // A link with headroom sharpens sooner; paint-overs never run while congested.
+        let paintover_delay_ms = if rc.slow_link {
+            cfg.paintover_delay_ms
+        } else {
+            cfg.paintover_delay_ms.min(PAINTOVER_DELAY_FAST_MS)
+        };
         let paintover_due = paintover_left > 0
             && !rc.congested
-            && last_motion.elapsed() >= Duration::from_millis(cfg.paintover_delay_ms);
+            && last_motion.elapsed() >= Duration::from_millis(paintover_delay_ms);
         if !cap.damaged && !want_key && !paintover_due {
-            let wait = cfg
-                .paintover_delay_ms
-                .saturating_sub(last_motion.elapsed().as_millis() as u64);
+            let wait = paintover_delay_ms.saturating_sub(last_motion.elapsed().as_millis() as u64);
             // A paint-over that is due but held back by congestion re-checks at the rate
             // controller's pace instead of spinning.
             let timeout = if paintover_left == 0 || wait == 0 {
@@ -838,6 +874,7 @@ fn capture_loop(
         hub.stats.captured.fetch_add(1, Ordering::Relaxed);
 
         let mut refine = None;
+        let mut paintover_first = false;
         let paintover = if is_motion {
             last_motion = Instant::now();
             paintover_left = cfg.paintover_burst;
@@ -846,10 +883,11 @@ fn capture_loop(
             refine = if want_key || rc.congested || cfg.paintover_burst == 0 {
                 None
             } else {
-                refiner.due(rc.target < SLOW_LINK_KBPS as f64)
+                refiner.due(rc.slow_link)
             };
             refine.is_some()
         } else if paintover_due {
+            paintover_first = paintover_left == cfg.paintover_burst.max(1) && !want_key;
             paintover_left -= 1;
             hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
             true
@@ -906,6 +944,7 @@ fn capture_loop(
                 idx,
                 force_idr: want_key,
                 paintover,
+                paintover_first: frame_paintover && paintover_first,
                 paintover_final: frame_paintover && paintover_left == 0,
                 mb_dirty: mb_map,
                 band,
@@ -968,7 +1007,7 @@ struct StripeJob {
     paintover: bool,
     crf: f32,
     cap: u32,
-    /// The session target is under `SLOW_LINK_KBPS`.
+    /// The rate controller sees a slow link (`Hub::slow_link`).
     slow_link: bool,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
@@ -1344,7 +1383,7 @@ fn encode_loop(
             continue;
         }
         let target = hub.target_kbps.load(Ordering::Relaxed);
-        let slow_link = target < SLOW_LINK_KBPS;
+        let slow_link = hub.slow_link.load(Ordering::Relaxed);
         let congested = hub.congested.load(Ordering::Relaxed);
         let want_crf = if job.paintover {
             po_crf
@@ -1368,7 +1407,11 @@ fn encode_loop(
         let mut pending = 0;
         for (i, &on) in selected.iter().enumerate() {
             if on {
-                let cap = if job.paintover && !slow_link {
+                // The first paint-over pass on a link with headroom gets room to reach the
+                // paint-over CRF in one frame; the rest of the burst tops it up.
+                let cap = if job.paintover_first && !slow_link && !congested {
+                    share.saturating_mul(4)
+                } else if job.paintover && !slow_link {
                     share.saturating_mul(2)
                 } else {
                     share

@@ -290,6 +290,9 @@ pub struct Hub {
     pub target_kbps: AtomicU32,
     /// True while the delay-based rate controller sees queueing on any client.
     pub congested: AtomicBool,
+    /// True once the rate controller has seen the path carry less than the slow-link
+    /// threshold (see `RateCtl::slow_link`); the encoder and refiner read it.
+    pub slow_link: AtomicBool,
     /// Maximum outbound clipboard image size in bytes (0 disables outbound image push).
     pub max_clipboard_image_bytes: AtomicU64,
     /// Last cursor message (id, full PNG/RGBA message), replayed to new clients.
@@ -324,6 +327,7 @@ impl Hub {
             height: AtomicU32::new(0),
             target_kbps: AtomicU32::new(0),
             congested: AtomicBool::new(false),
+            slow_link: AtomicBool::new(false),
             max_clipboard_image_bytes: AtomicU64::new(15 << 20),
             stripes: Mutex::new(Vec::new()),
             cursor: Mutex::new(None),
