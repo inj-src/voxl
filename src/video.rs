@@ -419,7 +419,7 @@ impl RateCtl {
         self.capacity_kbps = clients
             .iter()
             .filter(|c| !(healthy && c.stalled.load(Ordering::SeqCst)))
-            .map(|c| c.link_kbps.load(Ordering::Relaxed))
+            .map(|c| c.link_kbps())
             .min()
             .unwrap_or(0);
         let slow = SLOW_LINK_KBPS as f64;
@@ -553,15 +553,14 @@ impl RateCtl {
                 self.last_inc = now;
             }
         }
-        // Congestion that holds the target under the threshold says the path is slow; only
-        // a fast delivery sample (`Client::link_kbps`) says otherwise.
-        if self.target < SLOW_LINK_KBPS as f64 {
-            for c in hit {
-                c.reset_link();
-            }
+        // Congestion revokes a viewer's fast verdict; only a fresh fast delivery sample
+        // (`Client::link_kbps`) restores it.
+        for c in hit {
+            c.reset_link();
         }
         self.congested = congested;
         self.refresh_link(clients);
+        hub.congested.store(congested, Ordering::Relaxed);
         hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
     }
 }
@@ -712,6 +711,7 @@ fn capture_loop(
         cfg.start_kbps as f64,
     );
     rc.measured = cfg.fast_paintover_delay_ms.is_some();
+    hub.slow_link_measured.store(rc.measured, Ordering::Relaxed);
     hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
     let mut last_paintover = false;
     let mut had_clients = false;
@@ -764,6 +764,7 @@ fn capture_loop(
                     cfg.start_kbps as f64,
                 );
                 rc.measured = cfg.fast_paintover_delay_ms.is_some();
+                hub.congested.store(false, Ordering::Relaxed);
                 hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
             }
             had_clients = false;
@@ -771,6 +772,7 @@ fn capture_loop(
             continue;
         }
         rc.update(&hub, &clients);
+        hub.slow_link.store(rc.slow_link, Ordering::Relaxed);
         let eff_fps = if cfg.adaptive_fps {
             rc.effective_fps(cfg.fps)
         } else {
@@ -812,7 +814,7 @@ fn capture_loop(
         }
         let since = last_capture.elapsed();
         // Motion right after a paint-over pass goes out at once: the pass was extra.
-        let skip_interval = cfg.fast_paintover_delay_ms.is_some() && last_paintover && cap.damaged;
+        let skip_interval = fast_delay.is_some() && last_paintover && cap.damaged;
         if since < eff_min_interval && !skip_interval {
             let rem = eff_min_interval - since;
             wait_any(
@@ -1434,22 +1436,36 @@ fn encode_loop(
             continue;
         }
         let RateSnapshot {
-            target_kbps: target,
+            target_kbps,
             congested,
             slow_link,
             capacity_kbps,
             measured,
         } = job.rate;
-        // A keyframe goes to every viewer that has not started (joining or restarting).
-        // With measured links, any of them not measured fast gets the slow keyframe, sized
-        // from at most `UNMEASURED_KEY_KBPS`; the recipients are looked up now, at encode.
-        let key_slow = job.force_idr
-            && measured
-            && hub.video_clients().iter().any(|c| {
-                !c.draining.load(Ordering::SeqCst)
-                    && !c.started.load(Ordering::SeqCst)
-                    && c.link_kbps.load(Ordering::Relaxed) < SLOW_LINK_KBPS
-            });
+        // Measured links use the capture-time snapshot (it matches `rate_scale`); without
+        // them the rate is read live, at encode.
+        let (target, congested, slow_link) = if measured {
+            (target_kbps, congested, slow_link)
+        } else {
+            let t = hub.target_kbps.load(Ordering::Relaxed);
+            (t, hub.congested.load(Ordering::Relaxed), t < SLOW_LINK_KBPS)
+        };
+        // With measured links a keyframe starts the viewers that have not started (joining
+        // or restarting) as of now; if any of them is not measured fast, it takes the slow
+        // path, sized from at most `UNMEASURED_KEY_KBPS`. One that joins during the encode
+        // waits for the next keyframe.
+        let key_for: Option<Vec<u64>> = (job.force_idr && measured).then(|| {
+            hub.video_clients()
+                .iter()
+                .filter(|c| !c.draining.load(Ordering::SeqCst) && !c.started.load(Ordering::SeqCst))
+                .map(|c| c.id)
+                .collect()
+        });
+        let key_slow = key_for.as_ref().is_some_and(|ids| {
+            hub.video_clients()
+                .iter()
+                .any(|c| ids.contains(&c.id) && c.link_kbps() < SLOW_LINK_KBPS)
+        });
         let want_crf = if job.paintover {
             po_crf
         } else if slow_link && congested && target <= min_kbps.saturating_mul(3) / 2 {
@@ -1471,10 +1487,11 @@ fn encode_loop(
         } else {
             ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
         };
-        // On a link measured fast every paint-over and refine pass fits ~100 ms of measured
-        // delivery: its VBV buffers hold 1.25 frames of cap each.
+        // On a link measured fast every paint-over and refine pass fits ~50 ms of measured
+        // delivery (its VBV buffers hold 1.25 frames of cap each); a pass that can't reach
+        // the paint-over CRF in it leaves the rest to the next.
         let fast = measured && !slow_link;
-        let budget = (capacity_kbps as u64 * fps as u64 * 2 / (25 * n as u64)) as u32;
+        let budget = (capacity_kbps as u64 * fps as u64 / (25 * n as u64)) as u32;
         let ts = job.captured_at.duration_since(epoch).as_millis() as i64;
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
         let buf_ptr = SendPtr(&*job.buf as *const I420);
@@ -1584,7 +1601,7 @@ fn encode_loop(
                 continue;
             }
             if !c.started.load(Ordering::SeqCst) {
-                if !all_key {
+                if !all_key || key_for.as_ref().is_some_and(|ids| !ids.contains(&c.id)) {
                     continue;
                 }
                 if c.stalled.load(Ordering::SeqCst) {

@@ -176,7 +176,8 @@ async fn stats(State(s): State<AppState>) -> Response {
         .map(|c| {
             let (n, age) = c.backlog();
             serde_json::json!({"id": c.id, "video": c.video.load(Ordering::Relaxed), "inflight": n, "oldest_ms": age,
-                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "queue_ms": c.delay.lock().queue_ms as u64, "delivered_kbps": (c.delivered.lock().rate_bps / 1000.0) as u64})
+                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "queue_ms": c.delay.lock().queue_ms as u64, "delivered_kbps": (c.delivered.lock().rate_bps / 1000.0) as u64,
+                "link_kbps": c.link_kbps()})
         })
         .collect();
     let body = serde_json::json!({
@@ -188,6 +189,8 @@ async fn stats(State(s): State<AppState>) -> Response {
         "convert_us_total": st.convert_us.load(Ordering::Relaxed),
         "flow_blocked": st.flow_blocked.load(Ordering::Relaxed),
         "paintovers": st.paintovers.load(Ordering::Relaxed),
+        "slow_link": s.hub.slow_link.load(Ordering::Relaxed),
+        "slow_link_measured": s.hub.slow_link_measured.load(Ordering::Relaxed),
         "keyframes": st.keyframes.load(Ordering::Relaxed),
         "refines": st.refines.load(Ordering::Relaxed),
         "target_kbps": s.hub.target_kbps.load(Ordering::Relaxed),
@@ -349,7 +352,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
         }
         "a" => {
             if let Some(id) = num::<u32>(&mut it) {
-                c.on_ack(id, num::<u32>(&mut it).unwrap_or(0));
+                c.on_ack(id, num::<f64>(&mut it).unwrap_or(0.0));
                 s.hub.wake();
             }
         }

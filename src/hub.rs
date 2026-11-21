@@ -35,10 +35,7 @@ pub struct Client {
     pub delay: Mutex<DelayEst>,
     /// Cursor image IDs already sent to this client (capped FIFO for cache hits).
     pub known_cursors: Mutex<VecDeque<u32>>,
-    /// Delivery rate from acks (kbit/s): the best sample of the last `LINK_WINDOW`;
-    /// 0 until one is measured and after congestion or a stall. Under `SLOW_LINK_KBPS`
-    /// the viewer counts as a slow link.
-    pub link_kbps: AtomicU32,
+    /// Delivery samples from acks; see `link_kbps`.
     pub link: Mutex<LinkEst>,
     /// Went too long without acking (hidden tab, dead or saturated socket): left out of
     /// flow control and rate control until it acks the keyframe that restarts it.
@@ -61,14 +58,16 @@ pub struct DelayEst {
 /// A link counts as slow until its acks show it delivers at least this (kbit/s).
 pub const SLOW_LINK_KBPS: u32 = 2000;
 
-/// Bytes a delivery sample needs: 50 ms at `SLOW_LINK_KBPS`, well above RTT jitter.
-/// Smaller frames are added up until they reach it.
+/// A frame this big is timed on its own: 50 ms at `SLOW_LINK_KBPS`, well above RTT
+/// jitter. Smaller frames are also added up until they reach it.
 const LINK_SAMPLE_MIN_BYTES: usize = 12_500;
-/// Shortest delivery time a sample may span, and the closest two acks may arrive and
-/// still both count: a retransmit releases several acks at once.
+/// Shortest delivery time a sample is credited with, and the closest two frames may
+/// arrive and still count: a retransmit releases several at once.
 const LINK_SAMPLE_MIN_MS: f64 = 10.0;
-/// `link_kbps` is the best sample this recent, so one slow frame (decode, jitter) does
-/// not decide the verdict.
+/// An added-up sample of small frames carries each frame's RTT jitter, so it reads low;
+/// it revokes fast only under this.
+const LINK_POOL_SLOW_KBPS: u32 = 1000;
+/// Fast evidence counts this long; without fresh evidence the viewer is unmeasured.
 const LINK_WINDOW: Duration = Duration::from_secs(2);
 
 /// Delivery samples for `Client::link_kbps`.
@@ -76,12 +75,35 @@ const LINK_WINDOW: Duration = Duration::from_secs(2);
 pub struct LinkEst {
     /// When the last acked frame reached the viewer (ack time minus its hold).
     last_arrival: Option<Instant>,
-    /// Frames too small to sample alone, added up: bytes, delivery ms, first added.
+    /// Frames too small to time alone, added up: bytes, delivery ms, first added.
     pool_bytes: usize,
     pool_ms: f64,
     pool_at: Option<Instant>,
-    /// Samples (kbit/s, when) of the last `LINK_WINDOW`.
-    samples: VecDeque<(u32, Instant)>,
+    /// Samples at or above `SLOW_LINK_KBPS` (kbit/s, when), of the last `LINK_WINDOW`.
+    fast: VecDeque<(u32, Instant)>,
+    /// The sample that last revoked fast (kbit/s); 0 if none since a reset.
+    slow_kbps: u32,
+}
+
+impl LinkEst {
+    /// `whole`: one frame of `LINK_SAMPLE_MIN_BYTES` or more, or a small frame that
+    /// still read fast (jitter only lowers a sample, so a fast one is trustworthy).
+    fn record(&mut self, kbps: u32, whole: bool, now: Instant) {
+        if kbps >= SLOW_LINK_KBPS {
+            self.fast
+                .retain(|&(_, t)| now.saturating_duration_since(t) <= LINK_WINDOW);
+            self.fast.push_back((kbps, now));
+        } else if whole || kbps < LINK_POOL_SLOW_KBPS {
+            self.fast.clear();
+            self.slow_kbps = kbps;
+        }
+    }
+
+    fn clear_pool(&mut self) {
+        self.pool_bytes = 0;
+        self.pool_ms = 0.0;
+        self.pool_at = None;
+    }
 }
 
 pub struct RateEst {
@@ -95,19 +117,21 @@ impl Client {
         let _ = self.tx.send(m);
     }
 
-    /// `hold_ms`: how long the viewer held the frame before acking it (decode and
-    /// present), 0 from a viewer that does not say.
-    pub fn on_ack(&self, id: u32, hold_ms: u32) {
+    /// `hold_ms`: how long the viewer held the frame after its last part arrived (decode
+    /// and present), 0 from a viewer that does not say.
+    pub fn on_ack(&self, id: u32, hold_ms: f64) {
         let mut q = self.inflight.lock();
         let mut acked = 0;
         let mut sample = None;
         let mut first_sent = None;
+        let mut last_sent = None;
         while let Some(f) = q.front() {
             if wrapping_le(f.id, id) {
                 acked += f.bytes;
                 first_sent.get_or_insert(f.sent);
                 if f.id == id {
                     sample = Some(f.sent.elapsed().as_secs_f64() * 1000.0);
+                    last_sent = Some(f.sent);
                 }
                 q.pop_front();
             } else {
@@ -115,8 +139,8 @@ impl Client {
             }
         }
         drop(q);
-        if let Some(sent) = first_sent {
-            self.sample_link(sent, acked, hold_ms);
+        if let (Some(first), Some(last)) = (first_sent, last_sent) {
+            self.sample_link([first, last], acked, hold_ms);
         }
         if self.stalled.load(Ordering::SeqCst)
             && wrapping_le(self.resync_id.load(Ordering::SeqCst), id)
@@ -155,14 +179,18 @@ impl Client {
         }
     }
 
-    /// Delivery rate of the frames just acked: their bytes over the time they took to
-    /// arrive (bytes / (arrival - send - min RTT), from the previous arrival if they
-    /// queued behind it). Arrival is the ack time minus the viewer's hold.
-    fn sample_link(&self, sent: Instant, bytes: usize, hold_ms: u32) {
+    /// Delivery rate of the frames just acked (`sent`: the first and the acked one):
+    /// their bytes over the time they took to arrive (bytes / (arrival - send - min RTT),
+    /// from the previous arrival if they queued behind it). Arrival is the ack time minus
+    /// the viewer's hold.
+    fn sample_link(&self, sent: [Instant; 2], bytes: usize, hold_ms: f64) {
         let now = Instant::now();
-        let arrived = now
-            .checked_sub(Duration::from_millis(hold_ms.min(10_000) as u64))
-            .unwrap_or(now);
+        // A hold as long as the whole round trip is wrong; it says nothing.
+        let interval_ms = now.saturating_duration_since(sent[1]).as_secs_f64() * 1000.0;
+        if !(hold_ms >= 0.0 && hold_ms < interval_ms) {
+            return;
+        }
+        let arrived = now - Duration::from_secs_f64(hold_ms / 1000.0);
         let mut l = self.link.lock();
         let prev = l.last_arrival.replace(arrived);
         if prev.is_some_and(|p| {
@@ -181,39 +209,59 @@ impl Client {
         } else {
             0.0
         };
-        let mut start = sent + Duration::from_secs_f64(rtt_ms / 1000.0);
+        let mut start = sent[0] + Duration::from_secs_f64(rtt_ms / 1000.0);
         if let Some(p) = prev {
             start = start.max(p);
         }
-        if l.pool_at.is_some_and(|t| now - t > LINK_WINDOW) {
-            l.pool_bytes = 0;
-            l.pool_ms = 0.0;
-            l.pool_at = None;
+        // Arrived within the RTT baseline: too small to time, and no bytes are credited.
+        if arrived <= start {
+            return;
+        }
+        let ms = (arrived - start).as_secs_f64() * 1000.0;
+        let kbps = |b: usize, ms: f64| (b as f64 * 8.0 / ms.max(LINK_SAMPLE_MIN_MS)) as u32;
+        let one = kbps(bytes, ms);
+        if bytes >= LINK_SAMPLE_MIN_BYTES || one >= SLOW_LINK_KBPS {
+            l.record(one, true, now);
+            if bytes >= LINK_SAMPLE_MIN_BYTES {
+                return;
+            }
+        }
+        if l.pool_at
+            .is_some_and(|t| now.saturating_duration_since(t) > LINK_WINDOW)
+        {
+            l.clear_pool();
         }
         l.pool_at.get_or_insert(now);
         l.pool_bytes += bytes;
-        l.pool_ms += arrived.saturating_duration_since(start).as_secs_f64() * 1000.0;
+        l.pool_ms += ms;
         if l.pool_bytes < LINK_SAMPLE_MIN_BYTES || l.pool_ms < LINK_SAMPLE_MIN_MS {
             return;
         }
-        let kbps = (l.pool_bytes as f64 * 8.0 / l.pool_ms).min(u32::MAX as f64) as u32;
-        l.pool_bytes = 0;
-        l.pool_ms = 0.0;
-        l.pool_at = None;
-        l.samples.retain(|&(_, t)| now - t <= LINK_WINDOW);
-        l.samples.push_back((kbps, now));
-        let best = l.samples.iter().map(|&(k, _)| k).max().unwrap_or(0);
-        self.link_kbps.store(best, Ordering::Relaxed);
+        let pooled = kbps(l.pool_bytes, l.pool_ms);
+        l.clear_pool();
+        l.record(pooled, false, now);
+    }
+
+    /// Delivery rate (kbit/s): the best fast sample of the last `LINK_WINDOW`, else the
+    /// sample that revoked fast, else 0 (unmeasured). Under `SLOW_LINK_KBPS` the viewer
+    /// counts as a slow link.
+    pub fn link_kbps(&self) -> u32 {
+        let l = self.link.lock();
+        let now = Instant::now();
+        l.fast
+            .iter()
+            .filter(|&&(_, t)| now.saturating_duration_since(t) <= LINK_WINDOW)
+            .map(|&(k, _)| k)
+            .max()
+            .unwrap_or(l.slow_kbps)
     }
 
     /// Forgets the delivery rate: the viewer counts as a slow link until measured again.
     pub fn reset_link(&self) {
         let mut l = self.link.lock();
-        l.pool_bytes = 0;
-        l.pool_ms = 0.0;
-        l.pool_at = None;
-        l.samples.clear();
-        self.link_kbps.store(0, Ordering::Relaxed);
+        l.clear_pool();
+        l.fast.clear();
+        l.slow_kbps = 0;
     }
 
     /// Stops video to a client that stopped acking, so it neither gates the healthy
@@ -388,6 +436,12 @@ pub struct Hub {
     pub stripes: Mutex<Vec<(u32, u32)>>,
     /// Adaptive bitrate cap applied by the encoder (kbit/s).
     pub target_kbps: AtomicU32,
+    /// True while the delay-based rate controller sees queueing on any client.
+    pub congested: AtomicBool,
+    /// The rate controller's slow-link verdict, and whether it comes from delivery
+    /// samples (`--fast-paintover-delay-ms`), for `/stats`.
+    pub slow_link: AtomicBool,
+    pub slow_link_measured: AtomicBool,
     /// Maximum outbound clipboard image size in bytes (0 disables outbound image push).
     pub max_clipboard_image_bytes: AtomicU64,
     /// Last cursor message (id, full PNG/RGBA message), replayed to new clients.
@@ -421,6 +475,9 @@ impl Hub {
             width: AtomicU32::new(0),
             height: AtomicU32::new(0),
             target_kbps: AtomicU32::new(0),
+            congested: AtomicBool::new(false),
+            slow_link: AtomicBool::new(false),
+            slow_link_measured: AtomicBool::new(false),
             max_clipboard_image_bytes: AtomicU64::new(15 << 20),
             stripes: Mutex::new(Vec::new()),
             cursor: Mutex::new(None),
@@ -464,7 +521,6 @@ impl Hub {
                 queue_ms: 0.0,
             }),
             known_cursors: Mutex::new(VecDeque::new()),
-            link_kbps: AtomicU32::new(0),
             link: Mutex::new(LinkEst::default()),
             stalled: AtomicBool::new(false),
             draining: AtomicBool::new(false),

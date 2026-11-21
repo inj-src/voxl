@@ -40,6 +40,8 @@ interface PendingFrame {
 	need: number;
 	got: StripeFrame[];
 	t0: number;
+	/** When the frame's last part so far arrived; the ack's hold is measured from it. */
+	tLast: number;
 }
 let layout: Stripe[] = [];
 const stripes: StripeState[] = [];
@@ -243,7 +245,7 @@ function flush() {
 					g.frame.close();
 				}
 		}
-		send(cmd.ack(id, Math.round(performance.now() - f.t0)));
+		send(cmd.ack(id, performance.now() - f.tLast));
 		st.frames++;
 		st.decodeMs += performance.now() - f.t0;
 	}
@@ -255,11 +257,12 @@ function onVideo(b: Uint8Array) {
 	st.bytes += b.length;
 	let f = frames.get(h.frame);
 	if (!f) {
-		f = { need: h.parts, got: [], t0: performance.now() };
+		f = { need: h.parts, got: [], t0: performance.now(), tLast: 0 };
 		frames.set(h.frame, f);
 		order.push(h.frame);
 		st.pipeMs += h.pipe / 10;
 	}
+	f.tLast = performance.now();
 	const sd = stripeState(h.stripe);
 	if (sd.waitingKey && !h.key) {
 		f.need--;
