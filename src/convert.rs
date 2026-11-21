@@ -133,7 +133,7 @@ pub fn convert_band(
 }
 
 /// Scale `src` (`src_w` x `src_h` BGRX) to `dst.width` x `dst_h` for destination rows
-/// `[y0, y1)` (even-aligned) and convert into `dst` (I420), using libyuv box filtering.
+/// `[y0, y1)` (even-aligned) and convert into `dst` (I420), using libyuv bilinear filtering.
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 pub fn convert_scaled_band(
@@ -160,8 +160,8 @@ pub fn convert_scaled_band(
         SendPtr(dst.v.as_mut_ptr()),
     );
     let src_p = SendPtr(src.as_ptr() as *mut u8);
-    // kFilterBox = 3: crisp box-filter downscaling for UI text.
-    const K_FILTER_BOX: i32 = 3;
+    // kFilterBilinear = 2: fast bilinear downscaling (lower CPU than kFilterBox).
+    const K_FILTER_BILINEAR: i32 = 2;
     // ARGBScaleClip writes to `dst_argb + clip_y * dst_stride_argb`, so `scratch` must
     // span the full destination height (`dst_h`). Keep a thread-local buffer on the
     // capture thread to avoid allocating and faulting a multi-MB Vec on every frame.
@@ -191,7 +191,7 @@ pub fn convert_scaled_band(
                     a as i32,
                     dw as i32,
                     ch as i32,
-                    K_FILTER_BOX,
+                    K_FILTER_BILINEAR,
                 );
                 ARGBToI420(
                     tmp.get().add(a * dstride),

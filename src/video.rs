@@ -471,8 +471,8 @@ struct Refiner {
     cols: usize,
 }
 
-const REFINE_STILL_MS: u32 = 300;
-const REFINE_EVERY: Duration = Duration::from_millis(250);
+const REFINE_STILL_MS: u32 = 600;
+const REFINE_EVERY: Duration = Duration::from_millis(500);
 
 impl Refiner {
     fn new(blocks: usize, cols: usize) -> Self {
