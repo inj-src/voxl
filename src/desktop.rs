@@ -332,6 +332,7 @@ fn hash(data: &[u8]) -> u64 {
 fn publish(hub: &Hub, atoms: &Atoms, target: u32, data: Vec<u8>, last_image: &mut Option<u64>) {
     if target == atoms.png {
         let max_img = hub
+            .lb
             .max_clipboard_image_bytes
             .load(std::sync::atomic::Ordering::Relaxed) as usize;
         if max_img == 0 || data.is_empty() || data.len() > MAX_IMAGE.min(max_img) {

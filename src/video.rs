@@ -4,7 +4,8 @@ use crate::capture::{Band, Capturer};
 use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Hints, Planes};
 use crate::hub::wait_any;
-use crate::hub::{Hub, Inflight, Out, SLOW_LINK_KBPS};
+use crate::hub::{Hub, Inflight, Out};
+use crate::lowbw::SLOW_LINK_KBPS;
 use crate::sweep::{Next, Outcome, PassJob, Sweep};
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
@@ -113,7 +114,8 @@ pub fn spawn(
         *hub.resize_max.lock() = Some(s.max());
     }
     // Before any viewer joins: it decides whether viewers keep delivery samples.
-    hub.slow_link_measured
+    hub.lb
+        .slow_link_measured
         .store(cfg.fast_paintover_delay_ms.is_some(), Ordering::Relaxed);
     crate::encoder::set_tuning(cfg.ref_frames, cfg.me_range);
     let mut p = build(&cfg, &hub)?;
@@ -322,19 +324,19 @@ fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
     let clients = hub.video_clients();
     // Stalled viewers are ignored while a healthy one is watching; a lone stalled viewer
     // still gets flow control, or nothing would pace its stream.
-    let healthy = clients.iter().any(|c| !c.stalled.load(Ordering::SeqCst));
+    let healthy = clients.iter().any(|c| !c.lb.stalled.load(Ordering::SeqCst));
     for c in clients {
         let (n, age) = c.backlog();
         if n == 0 {
             continue;
         }
-        if c.draining.load(Ordering::SeqCst) {
+        if c.lb.draining.load(Ordering::SeqCst) {
             if age > stall_ms * 2 {
                 // It never acked what it was sent (a lost ack or a decoder reset): give up
                 // waiting and restart it with a keyframe.
                 log::warn!("client {} did not catch up in {} ms; restarting", c.id, age);
                 c.inflight.lock().clear();
-                c.draining.store(false, Ordering::SeqCst);
+                c.lb.draining.store(false, Ordering::SeqCst);
                 c.needs_keyframe.store(true, Ordering::Relaxed);
             }
             continue;
@@ -358,7 +360,7 @@ fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
             c.mark_stalled();
             continue;
         }
-        if healthy && c.stalled.load(Ordering::SeqCst) {
+        if healthy && c.lb.stalled.load(Ordering::SeqCst) {
             // Restarted but has not acked its keyframe yet: it must not gate the others.
             continue;
         }
@@ -432,14 +434,16 @@ impl RateCtl {
     /// Recomputes `slow_link` from the viewers now watching, so a join, leave or restart
     /// counts at once rather than on the next rate tick.
     fn refresh_link(&mut self, clients: &[Arc<crate::hub::Client>]) {
-        let healthy = clients.iter().any(|c| !c.stalled.load(Ordering::SeqCst));
+        let healthy = clients.iter().any(|c| !c.lb.stalled.load(Ordering::SeqCst));
         // A viewer that joined is unmeasured (0) until its keyframe is acked. A stalled
         // one counts once it is sent frames again: its restart keyframe goes out before
         // it acks it, and what follows queues behind that.
         self.capacity_kbps = clients
             .iter()
             .filter(|c| {
-                !(healthy && c.stalled.load(Ordering::SeqCst) && !c.started.load(Ordering::SeqCst))
+                !(healthy
+                    && c.lb.stalled.load(Ordering::SeqCst)
+                    && !c.started.load(Ordering::SeqCst))
             })
             .map(|c| c.link_floor_kbps())
             .min()
@@ -479,11 +483,13 @@ impl RateCtl {
         let mut clear = true;
         let mut rate = f64::MAX;
         let mut delivered = 0f64;
-        let healthy = clients.iter().any(|c| !c.stalled.load(Ordering::SeqCst));
+        let healthy = clients.iter().any(|c| !c.lb.stalled.load(Ordering::SeqCst));
         for c in clients {
             // A stalled viewer's delay is its own problem, not the path's, unless it is the
             // only one watching.
-            if !c.started.load(Ordering::Relaxed) || (healthy && c.stalled.load(Ordering::SeqCst)) {
+            if !c.started.load(Ordering::Relaxed)
+                || (healthy && c.lb.stalled.load(Ordering::SeqCst))
+            {
                 continue;
             }
             let (n, age) = c.backlog();
@@ -582,7 +588,7 @@ impl RateCtl {
         }
         self.congested = congested;
         self.refresh_link(clients);
-        hub.congested.store(congested, Ordering::Relaxed);
+        hub.lb.congested.store(congested, Ordering::Relaxed);
         hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
     }
 }
@@ -733,7 +739,9 @@ fn capture_loop(
         cfg.start_kbps as f64,
     );
     rc.measured = cfg.fast_paintover_delay_ms.is_some();
-    hub.slow_link_measured.store(rc.measured, Ordering::Relaxed);
+    hub.lb
+        .slow_link_measured
+        .store(rc.measured, Ordering::Relaxed);
     hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
     let mut last_paintover = false;
     let mut sweep: Option<Sweep> = None;
@@ -788,7 +796,7 @@ fn capture_loop(
                     cfg.start_kbps as f64,
                 );
                 rc.measured = cfg.fast_paintover_delay_ms.is_some();
-                hub.congested.store(false, Ordering::Relaxed);
+                hub.lb.congested.store(false, Ordering::Relaxed);
                 hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
             }
             had_clients = false;
@@ -796,7 +804,7 @@ fn capture_loop(
             continue;
         }
         rc.update(&hub, &clients);
-        hub.slow_link.store(rc.slow_link, Ordering::Relaxed);
+        hub.lb.slow_link.store(rc.slow_link, Ordering::Relaxed);
         let eff_fps = if cfg.adaptive_fps {
             rc.effective_fps(cfg.fps)
         } else {
@@ -807,7 +815,7 @@ fn capture_loop(
         let eff_interval_ms = eff_interval.as_secs_f64() * 1000.0;
         // A draining viewer would not be sent the keyframe, so its requests wait.
         let want_key = clients.iter().any(|c| {
-            c.needs_keyframe.load(Ordering::Relaxed) && !c.draining.load(Ordering::SeqCst)
+            c.needs_keyframe.load(Ordering::Relaxed) && !c.lb.draining.load(Ordering::SeqCst)
         });
         if !had_clients {
             had_clients = true;
@@ -825,7 +833,7 @@ fn capture_loop(
         // that isn't measured fast and congestion end it (motion does, below). So does a
         // stalled viewer, until its restart keyframe is acked: the link floor leaves it out
         // until that keyframe is sent, and passes queued meanwhile would follow it.
-        let stalled = clients.iter().any(|c| c.stalled.load(Ordering::SeqCst));
+        let stalled = clients.iter().any(|c| c.lb.stalled.load(Ordering::SeqCst));
         let sweeping = fast_delay.is_some()
             && !rc.congested
             && !want_key
@@ -1025,7 +1033,7 @@ fn capture_loop(
         if want_key {
             for c in clients
                 .iter()
-                .filter(|c| !c.draining.load(Ordering::SeqCst))
+                .filter(|c| !c.lb.draining.load(Ordering::SeqCst))
             {
                 c.needs_keyframe.store(false, Ordering::Relaxed);
             }
@@ -1505,7 +1513,7 @@ fn encode_loop(
     let epoch = Instant::now();
     // Ids go on across display rebuilds, so an ack for a frame of the last pipeline
     // can't be read as one for this one's.
-    let mut frame_id = hub.frame_id.load(Ordering::Relaxed);
+    let mut frame_id = hub.lb.frame_id.load(Ordering::Relaxed);
     let n = stripes_in.len();
     let fps = stripes_in.first().map_or(30, |s| s.cfg.fps.max(1));
     let debug_stripes = std::env::var("VOXL_DEBUG_STRIPES").is_ok();
@@ -1567,7 +1575,11 @@ fn encode_loop(
             (target_kbps, congested, slow_link)
         } else {
             let t = hub.target_kbps.load(Ordering::Relaxed);
-            (t, hub.congested.load(Ordering::Relaxed), t < SLOW_LINK_KBPS)
+            (
+                t,
+                hub.lb.congested.load(Ordering::Relaxed),
+                t < SLOW_LINK_KBPS,
+            )
         };
         // With measured links a keyframe starts the viewers that have not started (joining
         // or restarting) as of now; if any of them is not measured fast, it takes the slow
@@ -1576,7 +1588,9 @@ fn encode_loop(
         let key_for: Option<Vec<u64>> = (job.force_idr && measured).then(|| {
             hub.video_clients()
                 .iter()
-                .filter(|c| !c.draining.load(Ordering::SeqCst) && !c.started.load(Ordering::SeqCst))
+                .filter(|c| {
+                    !c.lb.draining.load(Ordering::SeqCst) && !c.started.load(Ordering::SeqCst)
+                })
                 .map(|c| c.id)
                 .collect()
         });
@@ -1703,7 +1717,7 @@ fn encode_loop(
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
         }
         frame_id = frame_id.wrapping_add(1);
-        hub.frame_id.store(frame_id, Ordering::Relaxed);
+        hub.lb.frame_id.store(frame_id, Ordering::Relaxed);
         // Server-side pipeline latency (capture -> sent) in 1/10 ms, for client stats.
         let mut pipe = (job.captured_at.elapsed().as_micros() / 100).min(u32::MAX as u128) as u32;
         if job.marker_ms >= 0 {
@@ -1734,7 +1748,7 @@ fn encode_loop(
         for c in hub.video_clients() {
             let mut q = c.inflight.lock();
             // Checked under the lock `mark_stalled` takes, so nothing is queued after it.
-            if c.draining.load(Ordering::SeqCst) {
+            if c.lb.draining.load(Ordering::SeqCst) {
                 continue;
             }
             if !c.started.load(Ordering::SeqCst) {
@@ -1747,9 +1761,9 @@ fn encode_loop(
                 if !all_key || !for_it {
                     continue;
                 }
-                if c.stalled.load(Ordering::SeqCst) {
+                if c.lb.stalled.load(Ordering::SeqCst) {
                     // The restart keyframe: acking it ends the stall.
-                    c.resync_id.store(frame_id, Ordering::SeqCst);
+                    c.lb.resync_id.store(frame_id, Ordering::SeqCst);
                 }
                 c.started.store(true, Ordering::SeqCst);
                 q.clear();

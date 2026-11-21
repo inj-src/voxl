@@ -21,6 +21,7 @@ mod hub;
 #[cfg(target_os = "linux")]
 mod input;
 mod login;
+mod lowbw;
 #[cfg(target_os = "macos")]
 mod mac;
 mod mic;
@@ -201,11 +202,7 @@ async fn serve(a: HashMap<String, String>) {
     };
 
     let hub = hub::Hub::new();
-    let max_clip_img_kb = range_max(a.get("max-clipboard-image-kb"), 15360.0) as u64;
-    hub.max_clipboard_image_bytes.store(
-        max_clip_img_kb.saturating_mul(1024),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    lowbw::init_hub(&hub, &a);
     // --read-only: the viewer watches the desktop, it does not drive it. Only the
     // commands watching needs are accepted (see server::READ_ONLY_COMMANDS), uploads
     // are refused, and the page hides the controls that would send anything else.

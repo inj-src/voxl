@@ -146,6 +146,7 @@ fn clipboard_loop(hub: Arc<Hub>, state: Arc<Mutex<ClipState>>) {
                 return;
             }
             let max_img = hub
+                .lb
                 .max_clipboard_image_bytes
                 .load(std::sync::atomic::Ordering::Relaxed) as usize;
             if max_img == 0 {
