@@ -823,8 +823,15 @@ fn capture_loop(
         let fast_delay = cfg.fast_paintover_delay_ms.filter(|_| !rc.slow_link);
         let paintover_delay_ms = fast_delay.unwrap_or(cfg.paintover_delay_ms);
         // On a link measured fast, with AQ, a paint-over is a sweep. A keyframe, a viewer
-        // that isn't measured fast and congestion end it (motion does, below).
-        let sweeping = fast_delay.is_some() && !rc.congested && !want_key && sweep_layout.is_some();
+        // that isn't measured fast and congestion end it (motion does, below). So does a
+        // stalled viewer, until its restart keyframe is acked: the link floor leaves it out
+        // until that keyframe is sent, and passes queued meanwhile would follow it.
+        let stalled = clients.iter().any(|c| c.stalled.load(Ordering::SeqCst));
+        let sweeping = fast_delay.is_some()
+            && !rc.congested
+            && !want_key
+            && !stalled
+            && sweep_layout.is_some();
         // A pass's blocks stop being pending once it is coded, before this capture's
         // changes are marked.
         let mut next = sweep.as_mut().map(|s| s.wait(&mut refiner.pending));
