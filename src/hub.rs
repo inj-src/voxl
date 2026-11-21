@@ -35,6 +35,12 @@ pub struct Client {
     pub delay: Mutex<DelayEst>,
     /// Cursor image IDs already sent to this client (capped FIFO for cache hits).
     pub known_cursors: Mutex<VecDeque<u32>>,
+    /// Last delivery-rate sample from acks (kbit/s); 0 until one is measured and after
+    /// congestion or a stall. Under `SLOW_LINK_KBPS` the session counts as a slow link.
+    pub link_kbps: AtomicU32,
+    /// When the last ack arrived: a frame queued behind the previous one starts arriving
+    /// only after that one did.
+    pub last_ack: Mutex<Option<Instant>>,
     /// Went too long without acking (hidden tab, dead or saturated socket): left out of
     /// flow control and rate control until it acks the keyframe that restarts it.
     pub stalled: AtomicBool,
@@ -53,6 +59,13 @@ pub struct DelayEst {
     pub queue_ms: f64,
 }
 
+/// A link counts as slow until its acks show it delivers at least this (kbit/s).
+pub const SLOW_LINK_KBPS: u32 = 2000;
+
+/// Smallest ack worth a delivery sample: 25 ms at `SLOW_LINK_KBPS`, well above the
+/// timing noise of small frames.
+const LINK_SAMPLE_MIN_BYTES: usize = 6_250;
+
 pub struct RateEst {
     pub window_start: Instant,
     pub bytes: usize,
@@ -68,9 +81,11 @@ impl Client {
         let mut q = self.inflight.lock();
         let mut acked = 0;
         let mut sample = None;
+        let mut first_sent = None;
         while let Some(f) = q.front() {
             if wrapping_le(f.id, id) {
                 acked += f.bytes;
+                first_sent.get_or_insert(f.sent);
                 if f.id == id {
                     sample = Some(f.sent.elapsed().as_secs_f64() * 1000.0);
                 }
@@ -80,6 +95,9 @@ impl Client {
             }
         }
         drop(q);
+        if let Some(sent) = first_sent {
+            self.sample_link(sent, acked);
+        }
         if self.stalled.load(Ordering::SeqCst)
             && wrapping_le(self.resync_id.load(Ordering::SeqCst), id)
         {
@@ -117,6 +135,36 @@ impl Client {
         }
     }
 
+    /// Delivery rate of the frames just acked: their bytes over the time they took to
+    /// arrive (bytes / (ack - send - min RTT), from the previous ack if they queued
+    /// behind it).
+    fn sample_link(&self, sent: Instant, bytes: usize) {
+        let now = Instant::now();
+        let prev = self.last_ack.lock().replace(now);
+        if bytes < LINK_SAMPLE_MIN_BYTES {
+            return;
+        }
+        // The smaller of the ping RTT and the fastest ack, so a high ping can't inflate it.
+        let ping = match self.min_rtt_ms.load(Ordering::Relaxed) {
+            0 => f64::MAX,
+            r => r as f64,
+        };
+        let rtt_ms = ping.min(self.delay.lock().base_ms);
+        let rtt_ms = if rtt_ms.is_finite() && rtt_ms < 10_000.0 {
+            rtt_ms
+        } else {
+            0.0
+        };
+        let mut start = sent + std::time::Duration::from_secs_f64(rtt_ms / 1000.0);
+        if let Some(p) = prev {
+            start = start.max(p);
+        }
+        let ms = now.saturating_duration_since(start).as_secs_f64() * 1000.0;
+        let kbps = bytes as f64 * 8.0 / ms.max(1.0);
+        self.link_kbps
+            .store(kbps.min(u32::MAX as f64) as u32, Ordering::Relaxed);
+    }
+
     /// Stops video to a client that stopped acking, so it neither gates the healthy
     /// viewers nor piles more frames behind the ones it has not read yet.
     /// Only the last frame stays in flight, so `backlog` times how long draining takes.
@@ -130,6 +178,7 @@ impl Client {
         }
         self.stalled.store(true, Ordering::SeqCst);
         self.draining.store(true, Ordering::SeqCst);
+        self.link_kbps.store(0, Ordering::Relaxed);
         self.started.store(false, Ordering::SeqCst);
     }
 
@@ -288,11 +337,6 @@ pub struct Hub {
     pub stripes: Mutex<Vec<(u32, u32)>>,
     /// Adaptive bitrate cap applied by the encoder (kbit/s).
     pub target_kbps: AtomicU32,
-    /// True while the delay-based rate controller sees queueing on any client.
-    pub congested: AtomicBool,
-    /// True once the rate controller has seen the path carry less than the slow-link
-    /// threshold (see `RateCtl::slow_link`); the encoder and refiner read it.
-    pub slow_link: AtomicBool,
     /// Maximum outbound clipboard image size in bytes (0 disables outbound image push).
     pub max_clipboard_image_bytes: AtomicU64,
     /// Last cursor message (id, full PNG/RGBA message), replayed to new clients.
@@ -326,8 +370,6 @@ impl Hub {
             width: AtomicU32::new(0),
             height: AtomicU32::new(0),
             target_kbps: AtomicU32::new(0),
-            congested: AtomicBool::new(false),
-            slow_link: AtomicBool::new(false),
             max_clipboard_image_bytes: AtomicU64::new(15 << 20),
             stripes: Mutex::new(Vec::new()),
             cursor: Mutex::new(None),
@@ -371,6 +413,8 @@ impl Hub {
                 queue_ms: 0.0,
             }),
             known_cursors: Mutex::new(VecDeque::new()),
+            link_kbps: AtomicU32::new(0),
+            last_ack: Mutex::new(None),
             stalled: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             resync_id: AtomicU32::new(0),

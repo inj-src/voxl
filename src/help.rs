@@ -44,6 +44,9 @@ Video:
   --paintover-crf, --paintover-burst, --paintover-delay-ms
                                 sharpening once the screen goes still
                                 (default 16, 3, 150)
+  --fast-paintover-delay-ms     once acks show the link delivers 2 Mbps or more,
+                                start the paint-over after this many ms and
+                                refine still blocks sooner (default off)
   --stripes                     encode the screen as N independent streams
                                 (experimental, default 1)
   --convert-threads, --coalesce-us
