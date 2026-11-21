@@ -115,6 +115,7 @@ pub fn spawn(
     // Before any viewer joins: it decides whether viewers keep delivery samples.
     hub.slow_link_measured
         .store(cfg.fast_paintover_delay_ms.is_some(), Ordering::Relaxed);
+    crate::encoder::set_tuning(cfg.ref_frames, cfg.me_range);
     let mut p = build(&cfg, &hub)?;
     std::thread::Builder::new()
         .name("capture".into())
@@ -245,8 +246,6 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
             threads: fixed,
             crf: cfg.crf,
             max_kbps: cfg.max_kbps,
-            ref_frames: cfg.ref_frames,
-            me_range: cfg.me_range,
         };
         let max_threads = if cfg.adaptive_threads {
             (cfg.threads / layout.len() as u32).max(1)
@@ -1426,7 +1425,7 @@ fn stripe_worker(
         };
         let r = s
             .enc
-            .encode(&planes, job.ts, job.force_idr, hints, &mut out);
+            .encode_hinted(&planes, job.ts, job.force_idr, hints, &mut out);
         if debug {
             let cpu_now = thread_cpu_us();
             log::info!(
@@ -1928,8 +1927,6 @@ mod tests {
                     threads: 1,
                     crf,
                     max_kbps,
-                    ref_frames: None,
-                    me_range: 64,
                 })
                 .unwrap(),
                 motion: MotionQuality::default(),
@@ -1973,7 +1970,8 @@ mod tests {
                     &planes,
                     self.n as i64 * 16,
                     self.n == 0,
-                    Hints::default(),
+                    None,
+                    None,
                     &mut out,
                 )
                 .unwrap();

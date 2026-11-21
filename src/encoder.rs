@@ -10,8 +10,11 @@ mod ffi {
     include!(concat!(env!("OUT_DIR"), "/x264.rs"));
 }
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::CString;
 use std::ptr;
+
+mod lowbw;
+pub use lowbw::{set_tuning, Hints};
 
 #[derive(Clone)]
 pub struct EncoderConfig {
@@ -23,10 +26,6 @@ pub struct EncoderConfig {
     pub crf: f32,
     /// VBV cap in kbit/s (0 = uncapped).
     pub max_kbps: u32,
-    /// Reference frames (3-4 cut modal/tab re-encoding); None keeps the preset's.
-    pub ref_frames: Option<u32>,
-    /// Motion estimation search range in pixels (64 default; 96-128 helps low-fps scrolls).
-    pub me_range: u32,
 }
 
 pub struct Encoder {
@@ -36,41 +35,10 @@ pub struct Encoder {
     pts: i64,
     pub width: u32,
     pub height: u32,
-    /// Forced-QP frames are being encoded (`begin_forced_qp`).
-    forced_qp: bool,
-    /// `end_forced_qp` ran and no frame has been encoded since. x264 applies only the
-    /// last reconfig before a frame, so until then every reconfig turns the CRF max off.
-    clear_rf_max: bool,
+    lb: lowbw::QpState,
 }
 
 unsafe impl Send for Encoder {}
-
-/// Per-picture hints for `Encoder::encode`.
-#[derive(Default)]
-pub struct Hints<'a> {
-    /// Forces the frame QP.
-    pub qp: Option<i32>,
-    /// One byte per macroblock, X264_MBINFO_CONSTANT for unchanged ones: lets x264 skip
-    /// analysis of static areas.
-    pub mb_info: Option<&'a mut [u8]>,
-    /// QP offsets per macroblock, added to adaptive quantization's (none with AQ off).
-    pub quant_offsets: Option<&'a mut [f32]>,
-}
-
-/// The message x264 logs when a reconfig sets the CRF max to the CRF, which
-/// `end_forced_qp` does on purpose: that is what turns the max off again.
-const CRF_MAX_WARNING: &CStr = c"CRF max must be greater than CRF\n";
-
-/// x264's logger, minus `CRF_MAX_WARNING`. `p` is x264's own logger, passed on with the
-/// message untouched (`A` is the platform's va_list).
-unsafe extern "C" fn filter_log<A>(p: *mut c_void, level: c_int, fmt: *const c_char, args: A) {
-    if !fmt.is_null() && CStr::from_ptr(fmt) == CRF_MAX_WARNING {
-        return;
-    }
-    let log: unsafe extern "C" fn(*mut c_void, c_int, *const c_char, A) =
-        std::mem::transmute_copy(&p);
-    log(ptr::null_mut(), level, fmt, args);
-}
 
 pub struct Planes<'a> {
     pub y: &'a [u8],
@@ -106,9 +74,6 @@ impl Encoder {
             param.i_scenecut_threshold = 0;
             param.b_intra_refresh = 0;
             param.i_bframe = 0;
-            if let Some(r) = cfg.ref_frames {
-                param.i_frame_reference = r.clamp(1, 16) as i32;
-            }
             param.b_annexb = 1;
             param.b_repeat_headers = 1;
             param.b_aud = 0;
@@ -127,7 +92,7 @@ impl Encoder {
             // window or a fast scroll would be coded as new pixels every frame. UMH finds
             // those shifts (a third of the bits for a window drag) for about the same CPU.
             param.analyse.i_me_method = ffi::X264_ME_UMH as i32;
-            param.analyse.i_me_range = cfg.me_range.clamp(16, 256) as i32;
+            param.analyse.i_me_range = 64;
             // Per-macroblock "unchanged" hints from X damage let x264 skip analysis.
             param.analyse.b_mb_info = (std::env::var("VOXL_NO_MBINFO").is_err()) as i32;
             param.i_sync_lookahead = 0;
@@ -145,10 +110,7 @@ impl Encoder {
             param.vui.b_fullrange = 0;
             let profile = c"high";
             ffi::x264_param_apply_profile(&mut param, profile.as_ptr());
-            if let Some(log) = param.pf_log {
-                param.p_log_private = log as *mut c_void;
-                param.pf_log = Some(filter_log);
-            }
+            lowbw::tune(&mut param);
 
             let h = ffi::x264_encoder_open(&mut param);
             if h.is_null() {
@@ -165,62 +127,8 @@ impl Encoder {
                 pts: 0,
                 width: cfg.width,
                 height: cfg.height,
-                forced_qp: false,
-                clear_rf_max: false,
+                lb: Default::default(),
             })
-        }
-    }
-
-    /// Adaptive quantization is on, so `Hints::quant_offsets` take effect.
-    pub fn aq_enabled(&self) -> bool {
-        unsafe {
-            let mut p: ffi::x264_param_t = std::mem::zeroed();
-            ffi::x264_encoder_parameters(self.h, &mut p);
-            p.rc.i_aq_mode != 0 && p.rc.f_aq_strength > 0.0
-        }
-    }
-
-    /// Before frames with a forced QP (`Hints::qp`): a CRF of 0.01 with a max of 0.02
-    /// caps the QP VBV may raise rows to under the forced QP, so the frame keeps it.
-    /// The VBV buffer is left as it is and accounts for the frame.
-    pub fn begin_forced_qp(&mut self) {
-        if self.forced_qp {
-            return;
-        }
-        self.forced_qp = true;
-        self.clear_rf_max = false;
-        unsafe {
-            self.param.rc.f_rf_constant = 0.01;
-            self.param.rc.f_rf_constant_max = 0.02;
-            ffi::x264_encoder_reconfig(self.h, &mut self.param);
-        }
-    }
-
-    /// Back to CRF after forced-QP frames, at `crf`. A CRF max equal to the CRF turns
-    /// the max off (0 would keep the last one). x264 builds each reconfig from the
-    /// parameters it last applied, and applies only the last one before a frame, so
-    /// `set_rate_buf` repeats this until the next frame is encoded.
-    pub fn end_forced_qp(&mut self, crf: f32) {
-        if !self.forced_qp {
-            return;
-        }
-        self.forced_qp = false;
-        self.clear_rf_max = true;
-        unsafe {
-            self.set_crf_clearing_max(crf);
-            ffi::x264_encoder_reconfig(self.h, &mut self.param);
-        }
-    }
-
-    /// The CRF, with a max equal to it while `clear_rf_max`: x264 takes a max of 0 as
-    /// "keep the last one", so a CRF of 0 is raised to 0.01 for it.
-    fn set_crf_clearing_max(&mut self, crf: f32) {
-        if self.clear_rf_max {
-            let c = crf.max(0.01);
-            self.param.rc.f_rf_constant = c;
-            self.param.rc.f_rf_constant_max = c;
-        } else {
-            self.param.rc.f_rf_constant = crf;
         }
     }
 
@@ -236,7 +144,8 @@ impl Encoder {
     /// Reconfigure rate control with an explicit VBV buffer (kbit).
     pub fn set_rate_buf(&mut self, crf: f32, max_kbps: u32, buf_kbit: u32) {
         unsafe {
-            self.set_crf_clearing_max(crf);
+            self.param.rc.f_rf_constant = crf;
+            self.clear_rf_max(crf);
             if max_kbps > 0 {
                 self.param.rc.i_vbv_max_bitrate = max_kbps as i32;
                 self.param.rc.i_vbv_buffer_size = buf_kbit.max(1) as i32;
@@ -245,14 +154,17 @@ impl Encoder {
         }
     }
 
-    /// Encode one picture. `force_idr` requests a keyframe; `hints` are consumed before
-    /// this returns. Appends Annex-B output to `out`.
+    /// Encode one picture. `force_idr` requests a keyframe, `qp` (if set) forces the frame QP.
+    /// Appends Annex-B output to `out`.
+    /// `mb_info` (one byte per macroblock, X264_MBINFO_CONSTANT for unchanged ones) lets
+    /// x264 skip analysis of static areas; it is consumed before this returns.
     pub fn encode(
         &mut self,
         p: &Planes,
         ts_ms: i64,
         force_idr: bool,
-        hints: Hints,
+        qp: Option<i32>,
+        mb_info: Option<&mut [u8]>,
         out: &mut Vec<u8>,
     ) -> Result<Encoded, String> {
         unsafe {
@@ -267,13 +179,9 @@ impl Encoder {
             } else {
                 ffi::X264_TYPE_AUTO as i32
             };
-            self.pic.i_qpplus1 = hints.qp.map(|q| q + 1).unwrap_or(0);
-            self.pic.prop.mb_info = hints.mb_info.map_or(ptr::null_mut(), |m| m.as_mut_ptr());
+            self.pic.i_qpplus1 = qp.map(|q| q + 1).unwrap_or(0);
+            self.pic.prop.mb_info = mb_info.map(|m| m.as_mut_ptr()).unwrap_or(ptr::null_mut());
             self.pic.prop.mb_info_free = None;
-            self.pic.prop.quant_offsets = hints
-                .quant_offsets
-                .map_or(ptr::null_mut(), |q| q.as_mut_ptr());
-            self.pic.prop.quant_offsets_free = None;
             // Strictly increasing pts even if the wall clock stalls.
             self.pts = ts_ms.max(self.pts + 1);
             self.pic.i_pts = self.pts;
@@ -282,11 +190,6 @@ impl Encoder {
             let mut pic_out: ffi::x264_picture_t = std::mem::zeroed();
             let size =
                 ffi::x264_encoder_encode(self.h, &mut nals, &mut n, &mut self.pic, &mut pic_out);
-            if self.clear_rf_max {
-                // The max is off now; later reconfigs leave it off.
-                self.clear_rf_max = false;
-                self.param.rc.f_rf_constant_max = 0.0;
-            }
             if size < 0 {
                 return Err("x264_encoder_encode failed".into());
             }
@@ -372,8 +275,6 @@ mod bench {
                 threads,
                 crf: 24.0,
                 max_kbps: 30000,
-                ref_frames: None,
-                me_range: 64,
             })
             .unwrap();
             let mut y = vec![0u8; w * h];
@@ -408,10 +309,8 @@ mod bench {
                     &planes,
                     f as i64 * 16,
                     f == 0,
-                    Hints {
-                        mb_info: hint.then_some(&mut info[..]),
-                        ..Default::default()
-                    },
+                    None,
+                    if hint { Some(&mut info) } else { None },
                     &mut out,
                 )
                 .unwrap();
