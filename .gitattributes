@@ -1,1 +1,2 @@
 bench/**/*.html linguist-detectable=false
+patches/x264/*.patch -text

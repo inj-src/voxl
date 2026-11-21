@@ -10,6 +10,15 @@ code lives in files upstream doesn't have:
   (`sweep.rs`).
 - `src/encoder/lowbw.rs`: `--ref-frames`/`--me-range`, forced-QP frames, QP offsets.
 
+- `vcpkg/ports/x264/`: a vcpkg overlay port for the Windows build, vcpkg's own x264
+  port plus upstream's `patches/x264` (read from there by relative path, not copied).
+  Install with `vcpkg install x264 ... --overlay-ports=<repo>/vcpkg/ports`. The port
+  pins x264 `b35605ac`, which the patches were checked against. If you move the ref,
+  check them again. vcpkg's binary cache hashes only the port directory, so after
+  `patches/x264` changes, bump `port-version` in `vcpkg.json` or a cached build is reused.
+  `vcpkg/.gitattributes` and the `patches/x264` line in `.gitattributes` keep the
+  patches byte-exact on Windows checkouts (`core.autocrlf`).
+
 Fork state hangs off one field per upstream struct, always named `lb`.
 
 ## Hooks left in upstream files
@@ -36,6 +45,7 @@ Fork state hangs off one field per upstream struct, always named `lb`.
     `Encoder::encode_hinted`, `--motion-quality`, no governor reopen during a sweep.
   - `encode_loop`: `hub.lb.frame_id`, `sweep_stripes`, `report_skipped`, `EncodePlan`
     (`crf`, `share`, `cap`, `stripe_job`, `admit`), `PassReport`.
+- `.gitattributes`: `patches/x264/*.patch -text` (see `vcpkg/ports/x264/` above).
 - `server.rs`: `/stats` link fields, `send_current_cursor`, ack hold/arrival parsing,
   `restart_video` on "v". `record.rs`: `on_ack(id, 0.0, None)`.
 - `desktop.rs`, `mac/desktop.rs`, `win/desktop.rs`: `hub.lb.max_clipboard_image_bytes`,
