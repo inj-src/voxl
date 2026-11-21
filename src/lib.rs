@@ -29,6 +29,7 @@ mod record;
 #[cfg(target_os = "linux")]
 mod screen;
 mod server;
+mod sweep;
 mod tls;
 mod video;
 mod wait;

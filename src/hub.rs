@@ -45,6 +45,8 @@ pub struct Client {
     pub draining: AtomicBool,
     /// While draining, the last frame sent before the stall; after it, the restart keyframe.
     pub resync_id: AtomicU32,
+    /// Keeps delivery samples (`--fast-paintover-delay-ms`); without them `link` stays empty.
+    measure_link: bool,
 }
 
 /// Send->ack delay tracking: `base` is the (slowly expiring) minimum, the excess over
@@ -69,6 +71,8 @@ const LINK_SAMPLE_MIN_MS: f64 = 10.0;
 const LINK_POOL_SLOW_KBPS: u32 = 1000;
 /// Fast evidence counts this long; without fresh evidence the viewer is unmeasured.
 const LINK_WINDOW: Duration = Duration::from_secs(2);
+/// Most fast samples kept: a fast link acks many frames within `LINK_WINDOW`.
+const LINK_FAST_MAX: usize = 64;
 
 /// Delivery samples for `Client::link_kbps`.
 #[derive(Default)]
@@ -80,6 +84,9 @@ pub struct LinkEst {
     /// The viewer reports arrival times. Without them a frame that queued is timed from
     /// a server stamp that return-path delay can make late, so it never counts as fast.
     viewer_clock: bool,
+    /// The last frame timed: bytes and delivery ms. A frame that queued behind it is
+    /// timed together with it.
+    last_timed: Option<(usize, f64)>,
     /// Frames too small to time alone, added up: bytes, delivery ms, first added.
     pool_bytes: usize,
     pool_ms: f64,
@@ -98,11 +105,15 @@ impl LinkEst {
         if kbps >= SLOW_LINK_KBPS {
             if self.viewer_clock {
                 self.fast.push_back((kbps, now));
+                if self.fast.len() > LINK_FAST_MAX {
+                    self.fast.pop_front();
+                }
             }
         } else if !whole && kbps >= LINK_POOL_SLOW_KBPS {
             // Typing over a jittery relay: not evidence on its own, but no sign of a
-            // slow link either.
-            for e in self.fast.iter_mut() {
+            // slow link either. Only the newest sample stays fresh, so old ones can't
+            // hold the floor down or up for long.
+            if let Some(e) = self.fast.back_mut() {
                 e.1 = now;
             }
         } else {
@@ -141,9 +152,11 @@ impl Client {
     /// and present), 0 from a viewer that does not say. `arrived_v`: when that last part
     /// arrived, on the viewer's clock (ms).
     pub fn on_ack(&self, id: u32, hold_ms: f64, arrived_v: Option<f64>) {
-        // A frame read while draining may have waited many seconds: no delivery sample.
-        let draining = self.draining.load(Ordering::SeqCst);
         let mut q = self.inflight.lock();
+        // A frame read while draining may have waited many seconds: no delivery sample.
+        // Read under the lock `mark_stalled` takes, as the sample is taken, so no sample
+        // lands after its reset.
+        let draining = self.draining.load(Ordering::SeqCst);
         let mut acked = 0;
         let mut sample = None;
         let mut first_sent = None;
@@ -161,10 +174,12 @@ impl Client {
                 break;
             }
         }
-        drop(q);
-        if let (Some(first), Some(last), false) = (first_sent, last_sent, draining) {
+        if let (Some(first), Some(last), false, true) =
+            (first_sent, last_sent, draining, self.measure_link)
+        {
             self.sample_link([first, last], acked, (hold_ms, arrived_v));
         }
+        drop(q);
         if self.stalled.load(Ordering::SeqCst)
             && wrapping_le(self.resync_id.load(Ordering::SeqCst), id)
         {
@@ -206,7 +221,9 @@ impl Client {
     /// their bytes over the time they took to arrive, arrival - send - min RTT. Arrival
     /// is the ack time minus the viewer's hold (`viewer`: hold, arrival on its clock).
     /// Frames that queued behind the previous ones are timed from the previous arrival,
-    /// on the viewer's clock, which a delayed or bunched ack can't shorten.
+    /// on the viewer's clock, which a delayed or bunched ack can't shorten, together with
+    /// the frame they queued behind: one that finished late (a retransmit) releases the
+    /// next soon after, and that frame alone would read fast.
     fn sample_link(&self, sent: [Instant; 2], bytes: usize, viewer: (f64, Option<f64>)) {
         let (hold_ms, arrived_v) = viewer;
         let arrived_v = arrived_v.filter(|v| v.is_finite());
@@ -225,6 +242,7 @@ impl Client {
         let gap =
             gap_v.or(prev.map(|p| arrived.saturating_duration_since(p).as_secs_f64() * 1000.0));
         if gap.is_some_and(|g| g < LINK_SAMPLE_MIN_MS) {
+            l.last_timed = None;
             return;
         }
         // The smaller of the ping RTT and the fastest ack, so a high ping can't inflate it.
@@ -240,18 +258,27 @@ impl Client {
         };
         let start = sent[0] + Duration::from_secs_f64(rtt_ms / 1000.0);
         let since_start = arrived.saturating_duration_since(start).as_secs_f64() * 1000.0;
-        let ms = match (prev.filter(|&p| p > start), gap_v) {
-            // Both are at least the true delivery time; the viewer's gap is not shortened
-            // by return-path delay.
-            (Some(_), Some(g)) => g.min(since_start),
+        let queued = prev.filter(|&p| p > start);
+        let ms = match (queued, gap_v) {
+            // The viewer's gap: not shortened by return-path delay, nor by an RTT
+            // baseline that grew (which moves `start` later).
+            (Some(_), Some(g)) => g,
             (Some(p), None) => (arrived - p).as_secs_f64() * 1000.0,
             // Arrived within the RTT baseline: too small to time, and no bytes are credited.
-            (None, _) if arrived <= start => return,
+            (None, _) if arrived <= start => {
+                l.last_timed = None;
+                return;
+            }
             (None, _) => since_start,
         };
         let kbps = |b: usize, ms: f64| (b as f64 * 8.0 / ms.max(LINK_SAMPLE_MIN_MS)) as u32;
+        let ahead = l.last_timed.replace((bytes, ms));
         if bytes >= LINK_SAMPLE_MIN_BYTES {
-            l.record(kbps(bytes, ms), true, now);
+            let (b, t) = match (queued, ahead) {
+                (Some(_), Some((b, t))) => (bytes + b, ms + t),
+                _ => (bytes, ms),
+            };
+            l.record(kbps(b, t), true, now);
             return;
         }
         if l.pool_at
@@ -293,6 +320,7 @@ impl Client {
         l.slow_kbps = 0;
         l.last_arrival = None;
         l.last_arrival_v = None;
+        l.last_timed = None;
     }
 
     /// Stops video to a client that stopped acking, so it neither gates the healthy
@@ -309,6 +337,19 @@ impl Client {
         self.stalled.store(true, Ordering::SeqCst);
         self.draining.store(true, Ordering::SeqCst);
         self.started.store(false, Ordering::SeqCst);
+        self.reset_link();
+    }
+
+    /// Starts video to this client over (a new stream, or video turned back on): it waits
+    /// for a keyframe, and what was measured of its link no longer counts. Under the
+    /// inflight lock, like `mark_stalled`, so no sample from an older ack lands after.
+    pub fn restart_video(&self) {
+        let mut q = self.inflight.lock();
+        q.clear();
+        self.stalled.store(false, Ordering::SeqCst);
+        self.draining.store(false, Ordering::SeqCst);
+        self.started.store(false, Ordering::Relaxed);
+        self.needs_keyframe.store(true, Ordering::Relaxed);
         self.reset_link();
     }
 
@@ -556,6 +597,7 @@ impl Hub {
             stalled: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             resync_id: AtomicU32::new(0),
+            measure_link: self.slow_link_measured.load(Ordering::Relaxed),
         });
         self.clients.lock().push(c.clone());
         c
@@ -590,11 +632,7 @@ impl Hub {
     pub fn restart_clients(&self) {
         let hello = self.hello();
         for c in self.clients.lock().iter() {
-            c.inflight.lock().clear();
-            c.stalled.store(false, Ordering::SeqCst);
-            c.draining.store(false, Ordering::SeqCst);
-            c.started.store(false, Ordering::Relaxed);
-            c.needs_keyframe.store(true, Ordering::Relaxed);
+            c.restart_video();
             c.send(Out::Text(hello.clone()));
         }
     }

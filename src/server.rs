@@ -396,11 +396,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             let on = rest == "1";
             c.video.store(on, Ordering::Relaxed);
             if on {
-                c.inflight.lock().clear();
-                c.stalled.store(false, Ordering::SeqCst);
-                c.draining.store(false, Ordering::SeqCst);
-                c.started.store(false, Ordering::Relaxed);
-                c.needs_keyframe.store(true, Ordering::Relaxed);
+                c.restart_video();
             }
             s.hub.wake();
         }

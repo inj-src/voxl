@@ -2,13 +2,14 @@
 
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
-use crate::encoder::{Encoded, Encoder, EncoderConfig, Planes};
+use crate::encoder::{Encoded, Encoder, EncoderConfig, Hints, Planes};
 use crate::hub::wait_any;
 use crate::hub::{Hub, Inflight, Out, SLOW_LINK_KBPS};
+use crate::sweep::{PassJob, Sweep};
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -45,11 +46,10 @@ struct Job {
     paintover: bool,
     /// First pass of a fast paint-over burst (`--fast-paintover-delay-ms`).
     paintover_first: bool,
-    /// Last pass of a paint-over burst.
+    /// Last pass of a paint-over burst or sweep.
     paintover_final: bool,
-    /// On the last pass of a fast burst: the encoder fills in the rows of the stripes
-    /// that fell clearly short of the paint-over CRF, so capture can pass over them again.
-    sharp_check: Option<Arc<OnceLock<Vec<Band>>>>,
+    /// A sweep pass (`mb_dirty` holds its blocks).
+    sweep: Option<PassJob>,
     /// Rows that changed in this capture.
     band: Option<Band>,
     /// Per-macroblock change map for this capture (None: analyse everything).
@@ -77,13 +77,6 @@ struct RateSnapshot {
     measured: bool,
 }
 
-/// A fast paint-over pass whose effective CRF ends up more than this above the
-/// paint-over CRF left its stripe soft; another pass follows, at most `PO_EXTRA_PASSES`
-/// of them within `PO_EXTRA_FOR` of the burst's first pass.
-const PO_SHORT_CRF: f32 = 2.0;
-const PO_EXTRA_PASSES: u32 = 8;
-const PO_EXTRA_FOR: Duration = Duration::from_millis(300);
-
 /// The rate a keyframe for a viewer not yet measured fast is sized from, whatever
 /// `--start-kbps` is, so its first picture crosses a slow link well within the stall limit.
 const UNMEASURED_KEY_KBPS: u32 = 1500;
@@ -104,6 +97,8 @@ struct Pipeline {
     job_tx: mpsc::SyncSender<Job>,
     ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
     encode: std::thread::JoinHandle<()>,
+    /// The stripe layout when every stripe's encoder has AQ on, which the sweep needs.
+    sweep_layout: Option<Vec<(u32, u32)>>,
 }
 
 /// Runs the pipeline. With a `Screen` (dynamic resolution), a client's size request
@@ -117,6 +112,9 @@ pub fn spawn(
     if let Some(s) = &screen {
         *hub.resize_max.lock() = Some(s.max());
     }
+    // Before any viewer joins: it decides whether viewers keep delivery samples.
+    hub.slow_link_measured
+        .store(cfg.fast_paintover_delay_ms.is_some(), Ordering::Relaxed);
     let mut p = build(&cfg, &hub)?;
     std::thread::Builder::new()
         .name("capture".into())
@@ -126,8 +124,10 @@ pub fn spawn(
                 job_tx,
                 ret_rx,
                 encode,
+                sweep_layout,
             } = p;
-            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), job_tx, ret_rx) {
+            let chans = (job_tx, ret_rx);
+            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), chans, sweep_layout) {
                 #[cfg(target_os = "linux")]
                 let resized = cap.geometry_changed();
                 #[cfg(not(target_os = "linux"))]
@@ -263,6 +263,10 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
             applied_crf: -1.0,
         });
     }
+    let sweep_layout = stripes
+        .iter()
+        .all(|s| s.enc.aq_enabled())
+        .then(|| layout.clone());
     *hub.stripes.lock() = layout;
     let hub2 = hub.clone();
     let (crf, po_crf, min_kbps, motion_quality) =
@@ -303,6 +307,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
         job_tx,
         ret_rx,
         encode,
+        sweep_layout,
     })
 }
 
@@ -629,13 +634,6 @@ impl Refiner {
     fn clear_all(&mut self) {
         self.pending.fill(false);
     }
-    /// Keeps pending only the blocks within `rows`.
-    fn keep_rows(&mut self, rows: &[Band]) {
-        for (i, p) in self.pending.iter_mut().enumerate() {
-            let y = (i / self.cols * 16) as u32;
-            *p &= rows.iter().any(|b| b.y0 <= y && y < b.y1);
-        }
-    }
     /// Every block not yet sharpened (1 = encode) and the row band they span.
     fn pending_map(&self) -> Option<(Vec<u8>, Band)> {
         let (mut r0, mut r1) = (usize::MAX, 0);
@@ -712,8 +710,8 @@ fn capture_loop(
     cap: &mut Capturer,
     cfg: VideoConfig,
     hub: Arc<Hub>,
-    job_tx: mpsc::SyncSender<Job>,
-    ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
+    (job_tx, ret_rx): (mpsc::SyncSender<Job>, mpsc::Receiver<(usize, Box<I420>)>),
+    sweep_layout: Option<Vec<(u32, u32)>>,
 ) -> Result<(), String> {
     let (w, h) = (cap.width as usize, cap.height as usize);
     let mut pool: Vec<Option<Box<I420>>> = vec![
@@ -735,11 +733,8 @@ fn capture_loop(
     hub.slow_link_measured.store(rc.measured, Ordering::Relaxed);
     hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
     let mut last_paintover = false;
-    // A fast burst's last pass awaiting the encoder's verdict, the extra passes left,
-    // and when the burst's first pass went out.
-    let mut sharp_check: Option<Arc<OnceLock<Vec<Band>>>> = None;
-    let mut extra_left = PO_EXTRA_PASSES;
-    let mut burst_at = Instant::now();
+    let mut sweep: Option<Sweep> = None;
+    let sweep_qps = crate::sweep::qp_range(cfg.paintover_crf);
     let mut had_clients = false;
     let mut full_next = true;
     let mut refiner = Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16));
@@ -823,33 +818,34 @@ fn capture_loop(
         // never run while congested.
         let fast_delay = cfg.fast_paintover_delay_ms.filter(|_| !rc.slow_link);
         let paintover_delay_ms = fast_delay.unwrap_or(cfg.paintover_delay_ms);
-        // The burst ended: pass again over what the encoder left soft, while the link
-        // stays fast and the extra passes last; else it is done.
-        let verdict = sharp_check.as_ref().and_then(|c| c.get().cloned());
-        if verdict.is_some() || (sharp_check.is_some() && burst_at.elapsed() > PO_EXTRA_FOR) {
-            let short = verdict.unwrap_or_default();
-            if !short.is_empty()
-                && extra_left > 0
-                && burst_at.elapsed() < PO_EXTRA_FOR
-                && fast_delay.is_some()
-                && !rc.congested
-            {
-                refiner.keep_rows(&short);
-                paintover_left = 1;
-                extra_left -= 1;
-            } else {
-                refiner.clear_all();
-            }
-            sharp_check = None;
+        // On a link measured fast, with AQ, a paint-over is a sweep. A keyframe, a viewer
+        // that isn't measured fast and congestion end it (motion does, below).
+        let sweeping = fast_delay.is_some() && !rc.congested && !want_key && sweep_layout.is_some();
+        if !sweeping {
+            sweep = None;
         }
-        let paintover_due = paintover_left > 0
+        let mut paintover_due = paintover_left > 0
             && !rc.congested
             && last_motion.elapsed() >= Duration::from_millis(paintover_delay_ms);
+        // A sweep's next pass waits for the last one's size (the encoder wakes us), then
+        // for the link to carry it.
+        let mut sweep_wait = None;
+        if let (true, Some(s)) = (paintover_due, sweep.as_mut()) {
+            match s.wait() {
+                Some(d) if d.is_zero() => {}
+                d => {
+                    paintover_due = false;
+                    sweep_wait = Some(d.map_or(100, |d| d.as_millis() as i32 + 1));
+                }
+            }
+        }
         if !cap.damaged && !want_key && !paintover_due {
             let wait = paintover_delay_ms.saturating_sub(last_motion.elapsed().as_millis() as u64);
             // A paint-over that is due but held back by congestion re-checks at the rate
             // controller's pace instead of spinning.
-            let timeout = if paintover_left == 0 || wait == 0 {
+            let timeout = if let Some(t) = sweep_wait {
+                t
+            } else if paintover_left == 0 || wait == 0 {
                 100
             } else {
                 wait as i32 + 1
@@ -934,11 +930,24 @@ fn capture_loop(
             continue;
         }
         // Sharpen only what was sent at motion quality; nothing pending, nothing to send.
+        // A sweep takes the next run of it, sized for the link.
+        let mut sweep_pass = None;
         let paint_map = if paintover_due && !is_motion && !want_key {
-            match refiner.pending_map() {
+            let next = match (sweeping, &sweep_layout) {
+                (true, Some(layout)) => sweep
+                    .get_or_insert_with(|| Sweep::new(layout, refiner.cols, sweep_qps))
+                    .plan(&mut refiner.pending, rc.capacity_kbps, eff_min_interval)
+                    .map(|p| {
+                        sweep_pass = Some((p.job, p.last));
+                        (p.map, p.band)
+                    }),
+                _ => refiner.pending_map(),
+            };
+            match next {
                 Some(m) => Some(m),
                 None => {
                     paintover_left = 0;
+                    sweep = None;
                     continue;
                 }
             }
@@ -972,7 +981,7 @@ fn capture_loop(
         let paintover = if is_motion {
             last_motion = Instant::now();
             paintover_left = cfg.paintover_burst;
-            sharp_check = None;
+            sweep = None;
             // Piggyback sharpening of blocks that have gone still on this frame, unless
             // the link is currently congested.
             refine = if want_key || rc.congested || cfg.paintover_burst == 0 {
@@ -982,9 +991,21 @@ fn capture_loop(
             };
             refine.is_some()
         } else if paintover_due {
-            paintover_first =
-                fast_delay.is_some() && paintover_left == cfg.paintover_burst.max(1) && !want_key;
-            paintover_left -= 1;
+            match &sweep_pass {
+                // A sweep runs until nothing is pending.
+                Some((_, last)) => {
+                    if *last {
+                        paintover_left = 0;
+                        sweep = None;
+                    }
+                }
+                None => {
+                    paintover_first = fast_delay.is_some()
+                        && paintover_left == cfg.paintover_burst.max(1)
+                        && !want_key;
+                    paintover_left -= 1;
+                }
+            }
             hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -1002,20 +1023,11 @@ fn capture_loop(
             refiner.mark_all();
             paintover_left = cfg.paintover_burst.max(1);
             last_motion = Instant::now();
+            sweep = None;
         }
         let frame_paintover = paintover && refine.is_none();
-        if frame_paintover && paintover_first {
-            burst_at = Instant::now();
-            extra_left = PO_EXTRA_PASSES;
-        }
-        // A fast burst keeps what is pending until the encoder says it came out sharp.
-        let check = (frame_paintover && paintover_left == 0 && fast_delay.is_some())
-            .then(|| Arc::new(OnceLock::new()));
         if frame_paintover && paintover_left == 0 {
-            match &check {
-                Some(c) => sharp_check = Some(c.clone()),
-                None => refiner.clear_all(),
-            }
+            refiner.clear_all();
         }
         // A refinement frame encodes what moved plus what is due; everything else stays skipped.
         let mb_map = if want_key {
@@ -1053,7 +1065,7 @@ fn capture_loop(
                 paintover,
                 paintover_first: frame_paintover && paintover_first,
                 paintover_final: frame_paintover && paintover_left == 0,
-                sharp_check: check,
+                sweep: sweep_pass.map(|(j, _)| j),
                 mb_dirty: mb_map,
                 band,
                 captured_at: origin,
@@ -1120,10 +1132,12 @@ struct StripeJob {
     slow_link: bool,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
+    /// A sweep pass at this QP: `mb_dirty` marks its blocks, the rest are skipped.
+    sweep_qp: Option<i32>,
 }
 
-/// A stripe's output: keyframe, bytes, x264's effective CRF.
-type StripeResult = (usize, Option<(bool, Vec<u8>, f32)>);
+/// A stripe's output: keyframe, bytes.
+type StripeResult = (usize, Option<(bool, Vec<u8>)>);
 
 /// x264's sliced threading costs ~3x the CPU of one thread on desktop content (and on
 /// small updates is even slower), so a stripe encodes single-threaded and only fans out
@@ -1320,6 +1334,9 @@ fn stripe_worker(
         predicted_ms: 0.0,
     };
     let mut motion = MotionQuality::default();
+    // The encoder was just reopened: its next frame is an IDR, which can't be a sweep
+    // pass (the blocks outside the pass would be coded at QP 51).
+    let mut fresh = false;
     while let Ok(job) = rx.recv() {
         let buf = unsafe { &*job.buf.0 };
         let is_motion = !job.force_idr && !job.paintover;
@@ -1328,7 +1345,12 @@ fn stripe_worker(
         } else {
             job.crf
         };
-        if job.force_idr {
+        let sweep_qp = job.sweep_qp.filter(|_| !std::mem::take(&mut fresh));
+        if sweep_qp.is_some() {
+            // The VBV cap stays the last motion frame's, and takes the pass's bytes.
+            s.enc.begin_forced_qp();
+        } else if job.force_idr {
+            s.enc.end_forced_qp(crf);
             // A keyframe is what a new viewer sees first. Give it up to ~8 frames at 4x
             // the cap; on a slow link keep the single IDR within ~1.25 s of the cap so it
             // does not trip the stall resync loop.
@@ -1343,6 +1365,7 @@ fn stripe_worker(
             }
             s.applied_kbps = 0;
         } else {
+            s.enc.end_forced_qp(crf);
             let moved = s.applied_kbps == 0
                 || (job.cap as f64 - s.applied_kbps as f64).abs() > s.applied_kbps as f64 * 0.04;
             if crf != s.applied_crf || moved {
@@ -1362,28 +1385,34 @@ fn stripe_worker(
         let mut out = Vec::with_capacity(64 << 10);
         out.resize(HDR, 0);
         // x264 wants X264_MBINFO_CONSTANT (1) on unchanged macroblocks of this stripe.
-        let mut info = job.mb_dirty.as_ref().map(|d| {
-            let rows = s.h.div_ceil(16);
+        let stripe_map = job.mb_dirty.as_ref().map(|d| {
             let start = (s.y / 16) * job.mb_cols;
-            d[start..start + rows * job.mb_cols]
-                .iter()
-                .map(|&x| (x == 0) as u8)
-                .collect::<Vec<u8>>()
+            &d[start..start + s.h.div_ceil(16) * job.mb_cols]
         });
+        let (mut info, mut offsets) = match (stripe_map, sweep_qp) {
+            (Some(m), Some(_)) => {
+                let (i, o) = crate::sweep::stripe_hints(m);
+                (Some(i), Some(o))
+            }
+            (m, _) => (
+                m.map(|m| m.iter().map(|&x| (x == 0) as u8).collect::<Vec<u8>>()),
+                None,
+            ),
+        };
         // Changed macroblocks in this stripe (all of them without a damage map).
         let stripe_mbs = s.h.div_ceil(16) * job.mb_cols;
         let changed = info
             .as_ref()
             .map_or(stripe_mbs, |m| m.iter().filter(|&&c| c == 0).count());
         let te = Instant::now();
-        let r = s.enc.encode(
-            &planes,
-            job.ts,
-            job.force_idr,
-            None,
-            info.as_deref_mut(),
-            &mut out,
-        );
+        let hints = Hints {
+            qp: sweep_qp,
+            mb_info: info.as_deref_mut(),
+            quant_offsets: offsets.as_deref_mut(),
+        };
+        let r = s
+            .enc
+            .encode(&planes, job.ts, job.force_idr, hints, &mut out);
         if debug {
             let cpu_now = thread_cpu_us();
             log::info!(
@@ -1412,6 +1441,7 @@ fn stripe_worker(
                         // A fresh encoder opens with an IDR on its next frame, and
                         // its rate control starts over.
                         s.enc = e;
+                        fresh = true;
                         motion = MotionQuality::default();
                         s.applied_kbps = 0;
                         gov.threads = t;
@@ -1430,8 +1460,11 @@ fn stripe_worker(
                     mbs: stripe_mbs,
                     crf: job.crf,
                 });
-                motion.note(&e, crf, size);
-                (out.len() > HDR).then_some((e.keyframe, out, e.crf_avg))
+                // A forced QP says nothing of the content's complexity.
+                if sweep_qp.is_none() {
+                    motion.note(&e, crf, size);
+                }
+                (out.len() > HDR).then_some((e.keyframe, out))
             }
             Err(e) => {
                 log::error!("{e}");
@@ -1479,19 +1512,23 @@ fn encode_loop(
         .collect();
     while let Ok(job) = rx.recv() {
         let t0 = Instant::now();
-        let selected: Vec<bool> = stripes
-            .iter()
-            .map(|&(y, h, touched)| {
-                job.force_idr
-                    || (job.paintover && touched)
-                    || job
-                        .band
-                        .is_some_and(|b| (b.y0 as usize) < y + h && (b.y1 as usize) > y)
-            })
-            .collect();
+        // A sweep pass codes the stripes it has blocks in.
+        let selected: Vec<bool> = match &job.sweep {
+            Some(p) => p.per_stripe.iter().map(|&b| b > 0).collect(),
+            None => stripes
+                .iter()
+                .map(|&(y, h, touched)| {
+                    job.force_idr
+                        || (job.paintover && touched)
+                        || job
+                            .band
+                            .is_some_and(|b| (b.y0 as usize) < y + h && (b.y1 as usize) > y)
+                })
+                .collect(),
+        };
         if !selected.iter().any(|&x| x) {
-            if let Some(c) = &job.sharp_check {
-                let _ = c.set(Vec::new());
+            if let Some(p) = &job.sweep {
+                let _ = p.report.set(vec![(0, 0); n]);
                 hub.wake();
             }
             let _ = ret.send((job.idx, job.buf));
@@ -1589,27 +1626,24 @@ fn encode_loop(
                     slow_link,
                     mb_dirty: job.mb_dirty.clone(),
                     mb_cols: job.buf.width.div_ceil(16),
+                    sweep_qp: job.sweep.as_ref().map(|p| p.qp),
                 });
                 pending += 1;
             }
         }
-        let mut results: Vec<Option<(bool, Vec<u8>, f32)>> = (0..n).map(|_| None).collect();
+        let mut results: Vec<Option<(bool, Vec<u8>)>> = (0..n).map(|_| None).collect();
         for _ in 0..pending {
             if let Ok((i, r)) = done_rx.recv() {
                 results[i] = r;
             }
         }
-        if let Some(c) = &job.sharp_check {
-            let short = results
+        if let Some(p) = &job.sweep {
+            let sizes = results
                 .iter()
-                .zip(&stripes)
-                .filter(|(r, _)| r.as_ref().is_some_and(|r| r.2 > want_crf + PO_SHORT_CRF))
-                .map(|(_, &(y, h, _))| Band {
-                    y0: y as u32,
-                    y1: (y + h) as u32,
-                })
+                .zip(&p.per_stripe)
+                .map(|(r, &b)| (b, r.as_ref().map_or(0, |r| r.1.len() - HDR)))
                 .collect();
-            let _ = c.set(short);
+            let _ = p.report.set(sizes);
             hub.wake();
         }
         let _ = ret.send((job.idx, job.buf));
@@ -1627,7 +1661,7 @@ fn encode_loop(
         let parts: Vec<(usize, bool, Vec<u8>)> = results
             .into_iter()
             .enumerate()
-            .filter_map(|(i, r)| r.map(|(k, o, _)| (i, k, o)))
+            .filter_map(|(i, r)| r.map(|(k, o)| (i, k, o)))
             .collect();
         if parts.is_empty() {
             continue;
@@ -1905,8 +1939,7 @@ mod tests {
                     &planes,
                     self.n as i64 * 16,
                     self.n == 0,
-                    None,
-                    None,
+                    Hints::default(),
                     &mut out,
                 )
                 .unwrap();
