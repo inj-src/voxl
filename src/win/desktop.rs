@@ -318,7 +318,9 @@ fn clipboard_loop(hub: Arc<Hub>, state: Arc<Mutex<ClipState>>) {
             hub.broadcast(|| Out::Text(msg.clone()));
             continue;
         }
-        let max_img = hub.max_clipboard_image_bytes.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        let max_img = hub
+            .max_clipboard_image_bytes
+            .load(std::sync::atomic::Ordering::Relaxed) as usize;
         if max_img == 0 {
             continue;
         }

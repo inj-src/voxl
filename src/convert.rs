@@ -15,7 +15,11 @@ extern "C" {
         width: i32,
         height: i32,
     ) -> i32;
+}
 
+// Capture-side downscaling is Windows-only (`--max-width`, `--capture-scale`).
+#[cfg(windows)]
+extern "C" {
     fn ARGBScaleClip(
         src_argb: *const u8,
         src_stride_argb: i32,
@@ -134,7 +138,7 @@ pub fn convert_band(
 
 /// Scale `src` (`src_w` x `src_h` BGRX) to `dst.width` x `dst_h` for destination rows
 /// `[y0, y1)` (even-aligned) and convert into `dst` (I420), using libyuv bilinear filtering.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 pub fn convert_scaled_band(
     src: &[u8],
@@ -212,7 +216,7 @@ pub fn convert_scaled_band(
 }
 
 /// Scale a full BGRX frame into `dst` (used by screenshots when capture downscaling is on).
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 pub fn scale_bgrx(
     src: &[u8],

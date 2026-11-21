@@ -34,7 +34,7 @@ Video:
                                 adaptive bitrate ceiling, floor and initial cap
                                 (default 30000, 2000, 8000)
   --preset                      x264 preset (default ultrafast)
-  --ref-frames                  x264 reference frames (default 1)
+  --ref-frames                  x264 reference frames (default: the preset's)
   --me-range                    x264 motion search range in pixels (default 64)
   --motion-quality              keep drags/scrolls at base CRF (default true)
   --adaptive-fps                step capture FPS down under congestion (default false)

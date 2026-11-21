@@ -23,8 +23,8 @@ pub struct EncoderConfig {
     pub crf: f32,
     /// VBV cap in kbit/s (0 = uncapped).
     pub max_kbps: u32,
-    /// Number of reference frames (1 = ultrafast default; 3-4 cuts modal/tab re-encoding).
-    pub ref_frames: u32,
+    /// Reference frames (3-4 cut modal/tab re-encoding); None keeps the preset's.
+    pub ref_frames: Option<u32>,
     /// Motion estimation search range in pixels (64 default; 96-128 helps low-fps scrolls).
     pub me_range: u32,
 }
@@ -74,7 +74,9 @@ impl Encoder {
             param.i_scenecut_threshold = 0;
             param.b_intra_refresh = 0;
             param.i_bframe = 0;
-            param.i_frame_reference = cfg.ref_frames.clamp(1, 16) as i32;
+            if let Some(r) = cfg.ref_frames {
+                param.i_frame_reference = r.clamp(1, 16) as i32;
+            }
             param.b_annexb = 1;
             param.b_repeat_headers = 1;
             param.b_aud = 0;
@@ -273,7 +275,7 @@ mod bench {
                 threads,
                 crf: 24.0,
                 max_kbps: 30000,
-                ref_frames: 1,
+                ref_frames: None,
                 me_range: 64,
             })
             .unwrap();

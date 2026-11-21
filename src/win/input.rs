@@ -237,6 +237,19 @@ enum ShiftFix {
     Lift,
 }
 
+/// A stream pixel on one axis -> the physical pixel under it. When the stream is
+/// scaled, the first and last stream pixels land on the first and last physical
+/// pixels, so the pointer reaches every screen edge.
+fn scale_axis(v: i32, stream: u32, physical: u32) -> i64 {
+    let last_s = stream.saturating_sub(1) as i64;
+    let v = (v as i64).clamp(0, last_s);
+    if stream == physical || last_s == 0 {
+        return v;
+    }
+    let last_p = physical.saturating_sub(1) as i64;
+    (v * last_p + last_s / 2) / last_s
+}
+
 impl Injector {
     fn key_event(&self, vk: VIRTUAL_KEY, ext: bool, down: bool) -> INPUT {
         let hkl = layout();
@@ -284,20 +297,8 @@ impl Injector {
                 GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
             )
         };
-        let sw = g.stream_width.max(1) as i64;
-        let sh = g.stream_height.max(1) as i64;
-        let cx = x.clamp(0, g.stream_width.saturating_sub(1) as i32) as i64;
-        let cy = y.clamp(0, g.stream_height.saturating_sub(1) as i32) as i64;
-        let dx = if g.stream_width == g.width {
-            cx
-        } else {
-            ((cx * g.width as i64 + sw / 2) / sw).clamp(0, g.width.saturating_sub(1) as i64)
-        };
-        let dy = if g.stream_height == g.height {
-            cy
-        } else {
-            ((cy * g.height as i64 + sh / 2) / sh).clamp(0, g.height.saturating_sub(1) as i64)
-        };
+        let dx = scale_axis(x, g.stream_width, g.width);
+        let dy = scale_axis(y, g.stream_height, g.height);
         let px = g.left as i64 + dx - vx as i64;
         let py = g.top as i64 + dy - vy as i64;
         // Windows maps n back to n * size / 65536 pixels; aim at the pixel's centre.

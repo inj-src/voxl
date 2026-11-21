@@ -30,7 +30,7 @@ pub struct VideoConfig {
     pub coalesce: Duration,
     pub stripes: u32,
     pub adaptive_threads: bool,
-    pub ref_frames: u32,
+    pub ref_frames: Option<u32>,
     pub me_range: u32,
     pub motion_quality: bool,
     pub adaptive_fps: bool,
@@ -49,7 +49,15 @@ struct Job {
     mb_dirty: Option<Arc<Vec<u8>>>,
     captured_at: Instant,
     marker_ms: i64,
+    /// `--framerate` over the capture rate adaptive FPS settled on. x264 budgets each
+    /// frame as 1/`--framerate` of the cap, so the cap is scaled up by this to keep the
+    /// bitrate at the target when fewer frames are captured.
+    rate_scale: f64,
 }
+
+/// The default `--min-kbps`. A session that keeps the default floor never drops below
+/// it, so the slow-link rules gated on it only run where `--min-kbps` was lowered.
+const SLOW_LINK_KBPS: u32 = 2000;
 
 fn union(a: Option<Band>, b: Band) -> Band {
     match a {
@@ -278,9 +286,24 @@ fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
     } else {
         4_000
     };
-    for c in hub.video_clients() {
+    let clients = hub.video_clients();
+    // Stalled viewers are ignored while a healthy one is watching; a lone stalled viewer
+    // still gets flow control, or nothing would pace its stream.
+    let healthy = clients.iter().any(|c| !c.stalled.load(Ordering::SeqCst));
+    for c in clients {
         let (n, age) = c.backlog();
         if n == 0 {
+            continue;
+        }
+        if c.draining.load(Ordering::SeqCst) {
+            if age > stall_ms * 2 {
+                // It never acked what it was sent (a lost ack or a decoder reset): give up
+                // waiting and restart it with a keyframe.
+                log::warn!("client {} did not catch up in {} ms; restarting", c.id, age);
+                c.inflight.lock().clear();
+                c.draining.store(false, Ordering::SeqCst);
+                c.needs_keyframe.store(true, Ordering::Relaxed);
+            }
             continue;
         }
         let rtt = match c.min_rtt_ms.load(Ordering::Relaxed) {
@@ -291,16 +314,19 @@ fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
         let max_n = (((rtt + 40.0) / interval_ms).ceil() as usize + 2).clamp(3, 40);
         let max_age = rtt as u128 + 120;
         if age > stall_ms {
-            // Stalled client (hidden tab, dead socket): stop letting it gate everyone.
+            // Stalled client (hidden tab, dead socket): stop letting it gate everyone,
+            // and stop sending to it until it has read what it was already sent.
             log::warn!(
-                "client {} stalled ({} frames, {} ms); resyncing",
+                "client {} stalled ({} frames, {} ms); pausing its video",
                 c.id,
                 n,
                 age
             );
-            c.inflight.lock().clear();
-            c.needs_keyframe.store(true, Ordering::Relaxed);
-            c.started.store(false, Ordering::Relaxed);
+            c.mark_stalled();
+            continue;
+        }
+        if healthy && c.stalled.load(Ordering::SeqCst) {
+            // Restarted but has not acked its keyframe yet: it must not gate the others.
             continue;
         }
         if n >= max_n || age > max_age {
@@ -330,6 +356,7 @@ struct RateCtl {
 
 impl RateCtl {
     fn new(max: f64, min: f64, start: f64) -> Self {
+        let min = min.min(max);
         let past = Instant::now() - Duration::from_secs(10);
         RateCtl {
             target: start.clamp(min, max),
@@ -370,12 +397,24 @@ impl RateCtl {
         let mut clear = true;
         let mut rate = f64::MAX;
         let mut delivered = 0f64;
+        let healthy = clients.iter().any(|c| !c.stalled.load(Ordering::SeqCst));
         for c in clients {
-            if !c.started.load(Ordering::Relaxed) {
+            // A stalled viewer's delay is its own problem, not the path's, unless it is the
+            // only one watching.
+            if !c.started.load(Ordering::Relaxed) || (healthy && c.stalled.load(Ordering::SeqCst)) {
                 continue;
             }
-            let q = c.delay.lock().queue_ms;
-            let (_, age) = c.backlog();
+            let (n, age) = c.backlog();
+            let q = {
+                let mut e = c.delay.lock();
+                // Queueing delay is only measured on acks. Once everything sent has been
+                // acked nothing of ours is queued, so the last burst's delay is stale:
+                // keeping it would hold an idle session congested forever.
+                if n == 0 {
+                    e.queue_ms = 0.0;
+                }
+                e.queue_ms
+            };
             let rtt = match c.min_rtt_ms.load(Ordering::Relaxed) {
                 0 => 40,
                 r => r,
@@ -471,8 +510,10 @@ struct Refiner {
     cols: usize,
 }
 
-const REFINE_STILL_MS: u32 = 600;
-const REFINE_EVERY: Duration = Duration::from_millis(500);
+/// How long a block stays still before it is sharpened, and how often a refinement
+/// pass may run. Slow links wait twice as long so refinement doesn't compete with motion.
+const REFINE_STILL_MS: u32 = 300;
+const REFINE_EVERY: Duration = Duration::from_millis(250);
 
 impl Refiner {
     fn new(blocks: usize, cols: usize) -> Self {
@@ -530,15 +571,16 @@ impl Refiner {
         })
     }
     /// Blocks due for sharpening (1 = refine) and the row band they span.
-    fn due(&mut self) -> Option<(Vec<u8>, Band)> {
-        if self.last_refine.elapsed() < REFINE_EVERY {
+    fn due(&mut self, slow_link: bool) -> Option<(Vec<u8>, Band)> {
+        let k = if slow_link { 2 } else { 1 };
+        if self.last_refine.elapsed() < REFINE_EVERY * k {
             return None;
         }
         let now = self.now();
         let mut map = vec![0u8; self.pending.len()];
         let (mut r0, mut r1, mut any) = (usize::MAX, 0, false);
         for (i, m) in map.iter_mut().enumerate() {
-            if self.pending[i] && now.saturating_sub(self.changed_ms[i]) >= REFINE_STILL_MS {
+            if self.pending[i] && now.saturating_sub(self.changed_ms[i]) >= REFINE_STILL_MS * k {
                 *m = 1;
                 self.pending[i] = false;
                 let row = i / self.cols;
@@ -658,9 +700,10 @@ fn capture_loop(
         let eff_interval = Duration::from_secs_f64(1.0 / eff_fps.max(1) as f64);
         let eff_min_interval = eff_interval.mul_f64(0.85);
         let eff_interval_ms = eff_interval.as_secs_f64() * 1000.0;
-        let want_key = clients
-            .iter()
-            .any(|c| c.needs_keyframe.load(Ordering::Relaxed));
+        // A draining viewer would not be sent the keyframe, so its requests wait.
+        let want_key = clients.iter().any(|c| {
+            c.needs_keyframe.load(Ordering::Relaxed) && !c.draining.load(Ordering::SeqCst)
+        });
         if !had_clients {
             had_clients = true;
             // Our shm copy may be stale: re-grab everything once.
@@ -673,12 +716,15 @@ fn capture_loop(
             && !rc.congested
             && last_motion.elapsed() >= Duration::from_millis(cfg.paintover_delay_ms);
         if !cap.damaged && !want_key && !paintover_due {
-            let timeout = if paintover_left == 0 {
+            let wait = cfg
+                .paintover_delay_ms
+                .saturating_sub(last_motion.elapsed().as_millis() as u64);
+            // A paint-over that is due but held back by congestion re-checks at the rate
+            // controller's pace instead of spinning.
+            let timeout = if paintover_left == 0 || wait == 0 {
                 100
             } else {
-                cfg.paintover_delay_ms
-                    .saturating_sub(last_motion.elapsed().as_millis() as u64) as i32
-                    + 1
+                wait as i32 + 1
             };
             wait_any(&[cap.fd(), hub.waker.waitable()], timeout);
             continue;
@@ -800,7 +846,7 @@ fn capture_loop(
             refine = if want_key || rc.congested || cfg.paintover_burst == 0 {
                 None
             } else {
-                refiner.due()
+                refiner.due(rc.target < SLOW_LINK_KBPS as f64)
             };
             refine.is_some()
         } else if paintover_due {
@@ -811,11 +857,17 @@ fn capture_loop(
             false
         };
         if want_key {
-            for c in &clients {
+            for c in clients
+                .iter()
+                .filter(|c| !c.draining.load(Ordering::SeqCst))
+            {
                 c.needs_keyframe.store(false, Ordering::Relaxed);
             }
-            // A keyframe is squeezed into the rate cap; sharpen all of it once still.
+            // A keyframe is squeezed into the rate cap; sharpen all of it once still,
+            // even when the screen does not move again.
             refiner.mark_all();
+            paintover_left = cfg.paintover_burst.max(1);
+            last_motion = Instant::now();
         }
         let frame_paintover = paintover && refine.is_none();
         if frame_paintover && paintover_left == 0 {
@@ -859,6 +911,7 @@ fn capture_loop(
                 band,
                 captured_at: origin,
                 marker_ms,
+                rate_scale: cfg.fps.max(1) as f64 / eff_fps.max(1) as f64,
             })
             .is_err()
         {
@@ -915,6 +968,8 @@ struct StripeJob {
     paintover: bool,
     crf: f32,
     cap: u32,
+    /// The session target is under `SLOW_LINK_KBPS`.
+    slow_link: bool,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
 }
@@ -1125,10 +1180,10 @@ fn stripe_worker(
             job.crf
         };
         if job.force_idr {
-            // A keyframe is what a new viewer sees first. On LAN/fast links give it up to
-            // ~8 frames at 4x the cap; on constrained uplinks (<4 Mbps) keep the single IDR
-            // within ~1.25 s of the link cap so it does not trip the stall resync loop.
-            if job.cap >= 4_000 {
+            // A keyframe is what a new viewer sees first. Give it up to ~8 frames at 4x
+            // the cap; on a slow link keep the single IDR within ~1.25 s of the cap so it
+            // does not trip the stall resync loop.
+            if !job.slow_link {
                 let boost = job.cap.saturating_mul(4).max(16_000);
                 s.enc
                     .set_rate_buf(job.crf, boost, boost / s.cfg.fps.max(1) * 8);
@@ -1289,18 +1344,20 @@ fn encode_loop(
             continue;
         }
         let target = hub.target_kbps.load(Ordering::Relaxed);
+        let slow_link = target < SLOW_LINK_KBPS;
         let congested = hub.congested.load(Ordering::Relaxed);
         let want_crf = if job.paintover {
             po_crf
-        } else if congested && target <= min_kbps.saturating_mul(3) / 2 {
+        } else if slow_link && congested && target <= min_kbps.saturating_mul(3) / 2 {
             // Smoothly raise QP when pinned near the floor instead of letting VBV slam QP 51.
             (crf + 4.0).min(38.0)
         } else {
             crf
         };
-        // With 1 stripe, use the exact target; with multiple stripes, each may use up to
-        // twice its area share while the delay-based controller reins the total in.
-        let share = if n == 1 {
+        // Each stripe may use up to twice its area share of the budget; the delay-based
+        // controller reins the total in if several stripes move at once. A single stripe
+        // on a slow link gets the exact target, since one burst at 2x already queues.
+        let share = if slow_link && n == 1 {
             target.max(1)
         } else {
             ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32
@@ -1311,10 +1368,16 @@ fn encode_loop(
         let mut pending = 0;
         for (i, &on) in selected.iter().enumerate() {
             if on {
-                let cap = if job.paintover && target >= 2_000 {
+                let cap = if job.paintover && !slow_link {
                     share.saturating_mul(2)
                 } else {
                     share
+                };
+                // Keyframes keep the unscaled cap: their size is bounded on its own.
+                let cap = if job.force_idr {
+                    cap
+                } else {
+                    (cap as f64 * job.rate_scale).round() as u32
                 };
                 let _ = workers[i].0.send(StripeJob {
                     buf: buf_ptr,
@@ -1323,6 +1386,7 @@ fn encode_loop(
                     paintover: job.paintover,
                     crf: want_crf,
                     cap,
+                    slow_link,
                     mb_dirty: job.mb_dirty.clone(),
                     mb_cols: job.buf.width.div_ceil(16),
                 });
@@ -1393,27 +1457,34 @@ fn encode_loop(
             .collect();
         let now = Instant::now();
         for c in hub.video_clients() {
-            if !c.started.load(Ordering::Relaxed) {
+            let mut q = c.inflight.lock();
+            // Checked under the lock `mark_stalled` takes, so nothing is queued after it.
+            if c.draining.load(Ordering::SeqCst) {
+                continue;
+            }
+            if !c.started.load(Ordering::SeqCst) {
                 if !all_key {
                     continue;
                 }
-                c.started.store(true, Ordering::Relaxed);
-                c.inflight.lock().clear();
-            }
-            {
-                let mut q = c.inflight.lock();
-                if q.len() > 600 {
-                    log::warn!("client {} hopelessly behind; dropping", c.id);
-                    drop(q);
-                    c.send(Out::Text("{\"t\":\"close\"}".into()));
-                    continue;
+                if c.stalled.load(Ordering::SeqCst) {
+                    // The restart keyframe: acking it ends the stall.
+                    c.resync_id.store(frame_id, Ordering::SeqCst);
                 }
-                q.push_back(Inflight {
-                    id: frame_id,
-                    sent: now,
-                    bytes: total,
-                });
+                c.started.store(true, Ordering::SeqCst);
+                q.clear();
             }
+            if q.len() > 600 {
+                log::warn!("client {} hopelessly behind; dropping", c.id);
+                drop(q);
+                c.send(Out::Text("{\"t\":\"close\"}".into()));
+                continue;
+            }
+            q.push_back(Inflight {
+                id: frame_id,
+                sent: now,
+                bytes: total,
+            });
+            drop(q);
             for m in &msgs {
                 c.send(Out::Bin(m.clone()));
             }
@@ -1570,7 +1641,7 @@ mod tests {
                     threads: 1,
                     crf,
                     max_kbps,
-                    ref_frames: 1,
+                    ref_frames: None,
                     me_range: 64,
                 })
                 .unwrap(),

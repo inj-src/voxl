@@ -464,7 +464,10 @@ impl Capturer {
     /// mapped to streamed coordinates (expanded by 1 px for box-filter edges).
     fn add_damage(&mut self, rects: Vec<(u32, u32, u32, u32)>) {
         let scaled = self.is_scaled();
-        let (pw, ph) = (self.geometry.width.max(1) as u64, self.geometry.height.max(1) as u64);
+        let (pw, ph) = (
+            self.geometry.width.max(1) as u64,
+            self.geometry.height.max(1) as u64,
+        );
         let (sw, sh) = (self.width as u64, self.height as u64);
         for (rx0, ry0, rx1, ry1) in rects {
             let (x0, y0, x1, y1) = if scaled {

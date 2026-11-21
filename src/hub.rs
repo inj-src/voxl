@@ -35,6 +35,14 @@ pub struct Client {
     pub delay: Mutex<DelayEst>,
     /// Cursor image IDs already sent to this client (capped FIFO for cache hits).
     pub known_cursors: Mutex<VecDeque<u32>>,
+    /// Went too long without acking (hidden tab, dead or saturated socket): left out of
+    /// flow control and rate control until it acks the keyframe that restarts it.
+    pub stalled: AtomicBool,
+    /// Stalled and still reading what was queued before the stall: it gets no video
+    /// until it acks `resync_id`, the last frame it was sent.
+    pub draining: AtomicBool,
+    /// While draining, the last frame sent before the stall; after it, the restart keyframe.
+    pub resync_id: AtomicU32,
 }
 
 /// Send->ack delay tracking: `base` is the (slowly expiring) minimum, the excess over
@@ -72,6 +80,19 @@ impl Client {
             }
         }
         drop(q);
+        if self.stalled.load(Ordering::SeqCst)
+            && wrapping_le(self.resync_id.load(Ordering::SeqCst), id)
+        {
+            if self.draining.load(Ordering::SeqCst) {
+                // It has read everything queued before the stall: restart it.
+                log::info!("client {} caught up; sending a keyframe", self.id);
+                self.needs_keyframe.store(true, Ordering::Relaxed);
+                self.draining.store(false, Ordering::SeqCst);
+            } else if self.started.load(Ordering::SeqCst) {
+                log::info!("client {} acked its restart keyframe", self.id);
+                self.stalled.store(false, Ordering::SeqCst);
+            }
+        }
         if let Some(ms) = sample {
             let mut e = self.delay.lock();
             if ms < e.base_ms || e.base_at.elapsed().as_secs() >= 10 {
@@ -94,6 +115,22 @@ impl Client {
             d.bytes = 0;
             d.window_start = Instant::now();
         }
+    }
+
+    /// Stops video to a client that stopped acking, so it neither gates the healthy
+    /// viewers nor piles more frames behind the ones it has not read yet.
+    /// Only the last frame stays in flight, so `backlog` times how long draining takes.
+    pub fn mark_stalled(&self) {
+        let mut q = self.inflight.lock();
+        let last = q.pop_back();
+        q.clear();
+        if let Some(f) = last {
+            self.resync_id.store(f.id, Ordering::SeqCst);
+            q.push_back(f);
+        }
+        self.stalled.store(true, Ordering::SeqCst);
+        self.draining.store(true, Ordering::SeqCst);
+        self.started.store(false, Ordering::SeqCst);
     }
 
     /// Frames in flight and age of the oldest unacknowledged one.
@@ -330,6 +367,9 @@ impl Hub {
                 queue_ms: 0.0,
             }),
             known_cursors: Mutex::new(VecDeque::new()),
+            stalled: AtomicBool::new(false),
+            draining: AtomicBool::new(false),
+            resync_id: AtomicU32::new(0),
         });
         self.clients.lock().push(c.clone());
         c
@@ -365,6 +405,8 @@ impl Hub {
         let hello = self.hello();
         for c in self.clients.lock().iter() {
             c.inflight.lock().clear();
+            c.stalled.store(false, Ordering::SeqCst);
+            c.draining.store(false, Ordering::SeqCst);
             c.started.store(false, Ordering::Relaxed);
             c.needs_keyframe.store(true, Ordering::Relaxed);
             c.send(Out::Text(hello.clone()));
@@ -411,7 +453,10 @@ impl Hub {
             enc.set_color(png::ColorType::Rgba);
             enc.set_depth(png::BitDepth::Eight);
             enc.set_compression(png::Compression::Fast);
-            match enc.write_header().and_then(|mut wr| wr.write_image_data(rgba)) {
+            match enc
+                .write_header()
+                .and_then(|mut wr| wr.write_image_data(rgba))
+            {
                 Ok(()) if out.len() < rgba.len() => Some(out),
                 _ => None,
             }
